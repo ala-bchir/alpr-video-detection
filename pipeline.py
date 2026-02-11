@@ -331,9 +331,9 @@ def pick_best_plate(group):
 
 
 def apply_filters(ocr_results, fps):
-    """Applique le filtre regex et la déduplication intelligente."""
+    """Applique le filtre de longueur et le padding."""
     print("\n" + "=" * 60)
-    print("🔤 ÉTAPE 4: Filtres (regex + déduplication intelligente)")
+    print("🔤 ÉTAPE 4: Filtre longueur")
     print("=" * 60)
     
     MAX_PLATE_LENGTH = 10  # au-delà c'est du bruit OCR
@@ -349,47 +349,7 @@ def apply_filters(ocr_results, fps):
             missing = STANDARD_PLATE_LENGTH - len(r["plate"])
             r["plate"] = r["plate"] + "*" * missing
     
-    # Trier par numéro de frame (ordre chronologique)
-    filtered.sort(key=lambda x: x["frame"])
-    
-    # Déduplication intelligente basée sur le temps de passage
-    TIME_WINDOW = 3  # secondes
-    FRAME_WINDOW = int(fps * TIME_WINDOW)  # frames dans la fenêtre de 3 secondes
-    MIN_COMMON = 3  # caractères en commun minimum pour considérer un doublon
-    
-    # Grouper les plaques par proximité temporelle + similarité
-    used = set()  # indices déjà traités
-    deduplicated = []
-    
-    for i, r in enumerate(filtered):
-        if i in used:
-            continue
-        
-        # Trouver les doublons potentiels dans la fenêtre de temps
-        group = [r]
-        used.add(i)
-        
-        for j in range(i + 1, len(filtered)):
-            if j in used:
-                continue
-            
-            # Vérifier la proximité temporelle
-            frame_diff = abs(filtered[j]["frame"] - r["frame"])
-            if frame_diff > FRAME_WINDOW:
-                break  # Les suivants sont trop loin (list triée)
-            
-            # Vérifier la similarité
-            # Si au moins 3 caractères en commun (consécutifs ou individuels) → doublons
-            if are_duplicates(r["plate"], filtered[j]["plate"]):
-                group.append(filtered[j])
-                used.add(j)
-        
-        # Choisir la meilleure plaque du groupe
-        best = pick_best_plate(group)
-        deduplicated.append(best)
-    
-    print(f"📋 Après déduplication intelligente: {len(deduplicated)} plaques uniques")
-    return deduplicated
+    return filtered
 
 
 def calculate_passage_times(results, start_time, fps):
@@ -474,6 +434,12 @@ def main():
         required=True,
         help="Heure de début de la vidéo (format HH:MM ou HH:MM:SS)"
     )
+    parser.add_argument(
+        "--time-window", "-w",
+        type=int,
+        default=3,
+        help="Fenêtre temporelle de déduplication en secondes (défaut: 3)"
+    )
     args = parser.parse_args()
     
     print("=" * 60)
@@ -536,15 +502,15 @@ def main():
         print("❌ Échec de l'OCR")
         sys.exit(1)
     
-    # Étape 4: Filtres
+    # Étape 4: Filtre longueur
     filtered_results = apply_filters(ocr_results, fps)
     if not filtered_results:
         print("⚠️  Aucune plaque valide après les filtres")
         sys.exit(0)
     
-    # Étape 4.5: Correction regex multi-format
+    # Étape 5: Correction regex multi-format
     print("\n" + "=" * 60)
-    print("📐 ÉTAPE 4.5: Correction regex multi-format")
+    print("📐 ÉTAPE 5: Correction regex multi-format")
     print("=" * 60)
     from regex_augmente import recognize_plate
     corrected = 0
@@ -558,10 +524,18 @@ def main():
             r["format"] = "UNKNOWN"
     print(f"✅ {corrected}/{len(filtered_results)} plaques corrigées et formatées")
     
-    # Étape 5: Calcul des heures
-    final_results = calculate_passage_times(filtered_results, args.start_time, fps)
+    # Étape 6: Déduplication intelligente
+    print("\n" + "=" * 60)
+    print(f"🔄 ÉTAPE 6: Déduplication (fenêtre {args.time_window}s)")
+    print("=" * 60)
+    from dedup_plates import deduplicate
+    deduplicated = deduplicate(filtered_results, fps, time_window=args.time_window)
+    print(f"📋 {len(filtered_results)} → {len(deduplicated)} plaques uniques")
     
-    # Étape 6: Export
+    # Étape 7: Calcul des heures
+    final_results = calculate_passage_times(deduplicated, args.start_time, fps)
+    
+    # Étape 8: Export
     output_file = export_csv(final_results, args.video)
     
     print("\n" + "=" * 60)
