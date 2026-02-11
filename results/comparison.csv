@@ -1,0 +1,10 @@
+model,accuracy_pct,cer_pct,wer_pct,time_ms_per_image
+GLM-OCR (0.9B),89.10,2.14,10.90,41
+Chandra,87.05,2.31,12.95,117
+Qwen2.5-VL-7B,87.10,2.41,12.90,95
+RolmOCR (7B),86.10,2.58,13.90,98
+Qwen2-VL-2B-OCR,84.15,2.91,15.85,46
+PaddleOCR-VL,69.90,8.53,30.10,43
+LightOnOCR-2-1B,62.00,1996.61,38.00,256
+DeepSeek-OCR-2,50.20,24.64,49.80,52
+Dots.OCR,49.25,72.47,50.75,61

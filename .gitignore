@@ -1,0 +1,4 @@
+__pycache__/
+data/
+dataset/
+sam3_weights.pt
