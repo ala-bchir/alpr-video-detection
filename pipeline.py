@@ -89,6 +89,11 @@ def stop_glm_server():
 def start_glm_server():
     """Démarre le serveur GLM-OCR."""
     print("\n🚀 Démarrage de GLM-OCR...")
+    # Supprimer l'ancien container s'il existe
+    subprocess.run(
+        ["docker", "rm", "-f", "qwen-labeler"],
+        capture_output=True, text=True
+    )
     result = subprocess.run(
         ["make", "start-glm-ocr"],
         cwd="/home/solayman/sam3_licencePlate_processing",
@@ -438,10 +443,10 @@ def export_csv(results, video_name):
     
     with open(output_file, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(["date_heure_passage", "numero_plaque"])
+        writer.writerow(["date_heure_passage", "numero_plaque", "format"])
         
         for r in results:
-            writer.writerow([r["passage_time"], r["plate"]])
+            writer.writerow([r["passage_time"], r["plate"], r.get("format", "UNKNOWN")])
     
     print(f"✅ CSV exporté: {output_file}")
     print(f"📊 Total: {len(results)} plaques uniques")
@@ -450,7 +455,7 @@ def export_csv(results, video_name):
     print("\n📋 Aperçu (5 premières lignes):")
     print("-" * 40)
     for r in results[:5]:
-        print(f"  {r['passage_time']} | {r['plate']}")
+        print(f"  {r['passage_time']} | {r['plate']} [{r.get('format', '')}]")
     if len(results) > 5:
         print(f"  ... et {len(results) - 5} autres")
     
@@ -540,6 +545,25 @@ def main():
     if not filtered_results:
         print("⚠️  Aucune plaque valide après les filtres")
         sys.exit(0)
+    
+    # Étape 4.5: Correction regex multi-format
+    print("\n" + "=" * 60)
+    print("📐 ÉTAPE 4.5: Correction regex multi-format")
+    print("=" * 60)
+    from regex_augmente import recognize_plate
+    corrected = 0
+    for r in filtered_results:
+        if r["plate"] == "NL":
+            r["format"] = "NL"
+            continue
+        result = recognize_plate(r["plate"])
+        if result.plate and result.format != "UNKNOWN":
+            r["plate"] = result.plate
+            r["format"] = result.format
+            corrected += 1
+        else:
+            r["format"] = "UNKNOWN"
+    print(f"✅ {corrected}/{len(filtered_results)} plaques corrigées et formatées")
     
     # Étape 5: Calcul des heures
     final_results = calculate_passage_times(filtered_results, args.start_time, fps)
