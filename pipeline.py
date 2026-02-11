@@ -44,11 +44,10 @@ GLM_MODEL = "zai-org/GLM-OCR"
 MIN_PLATE_LENGTH = 5
 STANDARD_PLATE_LENGTH = 7
 
-# Prompt OCR optimisé avec gestion des caractères illisibles
+# Prompt OCR optimisé
 OCR_PROMPT = """Read the license plate in this image.
 Output ONLY the plate text in uppercase (letters and numbers only, no spaces or dashes).
 If a character is unreadable or unclear, replace it with an asterisk (*).
-If the plate is completely unreadable, output only "NL".
 No explanation, no formatting, just the characters on the plate."""
 
 
@@ -337,10 +336,12 @@ def apply_filters(ocr_results, fps):
     print("🔤 ÉTAPE 4: Filtres (regex + déduplication intelligente)")
     print("=" * 60)
     
-    # Filtre: garder les NL (illisibles) + plaques ≥ MIN_PLATE_LENGTH
+    MAX_PLATE_LENGTH = 10  # au-delà c'est du bruit OCR
+    
+    # Filtre: garder seulement les plaques entre MIN et MAX longueur
     filtered = [r for r in ocr_results 
-                if r["plate"] == "NL" or len(r["plate"]) >= MIN_PLATE_LENGTH]
-    print(f"📋 Après filtre (≥{MIN_PLATE_LENGTH} chars ou NL): {len(filtered)}/{len(ocr_results)}")
+                if MIN_PLATE_LENGTH <= len(r["plate"]) <= MAX_PLATE_LENGTH]
+    print(f"📋 Après filtre ({MIN_PLATE_LENGTH}-{MAX_PLATE_LENGTH} chars): {len(filtered)}/{len(ocr_results)}")
     
     # Compléter les plaques courtes avec des * pour atteindre STANDARD_PLATE_LENGTH
     for r in filtered:
@@ -378,13 +379,8 @@ def apply_filters(ocr_results, fps):
                 break  # Les suivants sont trop loin (list triée)
             
             # Vérifier la similarité
-            # Si les deux sont NL → doublons (même voiture illisible)
-            if r["plate"] == "NL" and filtered[j]["plate"] == "NL":
-                group.append(filtered[j])
-                used.add(j)
             # Si au moins 3 caractères en commun (consécutifs ou individuels) → doublons
-            elif r["plate"] != "NL" and filtered[j]["plate"] != "NL" and \
-                 are_duplicates(r["plate"], filtered[j]["plate"]):
+            if are_duplicates(r["plate"], filtered[j]["plate"]):
                 group.append(filtered[j])
                 used.add(j)
         
@@ -553,9 +549,6 @@ def main():
     from regex_augmente import recognize_plate
     corrected = 0
     for r in filtered_results:
-        if r["plate"] == "NL":
-            r["format"] = "NL"
-            continue
         result = recognize_plate(r["plate"])
         if result.plate and result.format != "UNKNOWN":
             r["plate"] = result.plate

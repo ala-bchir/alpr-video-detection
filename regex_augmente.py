@@ -1,11 +1,9 @@
 """
-Module de reconnaissance et correction de plaques d'immatriculation multi-format.
+Module de reconnaissance et correction de plaques d'immatriculation.
 
 Formats supportés (par ordre de priorité) :
 1. SIV  (France, depuis 2009) : AA-123-AA
 2. FNI  (France, avant 2009)  : 1234 AB 57
-3. UK   (Royaume-Uni)         : AA12 AAA
-4. CH   (Suisse)              : AA 123456  (2 lettres + 1 à 6 chiffres)
 """
 
 import re
@@ -17,7 +15,7 @@ from typing import Literal
 # TYPES
 # ═══════════════════════════════════════════════════════════════════════════
 
-PlateFormat = Literal["SIV", "FNI", "UK", "CH", "UNKNOWN"]
+PlateFormat = Literal["SIV", "FNI", "UNKNOWN"]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -43,29 +41,6 @@ FNI_REGEX = re.compile(
     r'[\s\-]?'
     r'(\d{2})$'
 )
-
-# UK : AA12 AAA (2 lettres région + 2 chiffres âge + 3 lettres aléatoires)
-UK_REGEX = re.compile(
-    r'^([A-Z]{2})'
-    r'[\s\-]?'
-    r'(\d{2})'
-    r'[\s\-]?'
-    r'([A-Z]{3})$'
-)
-
-# Suisse : AA 1-6 chiffres (canton 2 lettres + numéro)
-CH_REGEX = re.compile(
-    r'^([A-Z]{2})'
-    r'[\s\-]?'
-    r'(\d{1,6})$'
-)
-
-# Cantons suisses valides
-CH_CANTONS = {
-    'AG', 'AI', 'AR', 'BE', 'BL', 'BS', 'FR', 'GE', 'GL', 'GR',
-    'JU', 'LU', 'NE', 'NW', 'OW', 'SG', 'SH', 'SO', 'SZ', 'TG',
-    'TI', 'UR', 'VD', 'VS', 'ZG', 'ZH',
-}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -290,81 +265,6 @@ def _try_fni(text: str) -> PlateResult | None:
     return None
 
 
-def _try_uk(text: str) -> PlateResult | None:
-    """Tente de matcher au format UK : AA12 AAA."""
-    text_clean = re.sub(r'[\s\-]', '', text)
-    if len(text_clean) != 7:
-        return None
-
-    corrections = 0
-    part_l1 = list(text_clean[0:2])   # 2 lettres
-    part_d  = list(text_clean[2:4])   # 2 chiffres
-    part_l2 = list(text_clean[4:7])   # 3 lettres
-
-    # Corriger zone chiffres
-    corr = _correct_zone(part_d, OCR_LETTER_TO_DIGIT, expect_digits=True)
-    if corr is None:
-        return None
-    corrections += corr
-
-    # Corriger zones lettres
-    for part in [part_l1, part_l2]:
-        corr = _correct_zone(part, OCR_DIGIT_TO_LETTER, expect_digits=False)
-        if corr is None:
-            return None
-        corrections += corr
-
-    plate = f"{''.join(part_l1)}{''.join(part_d)} {''.join(part_l2)}"
-
-    if UK_REGEX.match(plate):
-        return PlateResult(
-            raw_text=text, plate=plate, format="UK",
-            confidence=_compute_confidence(corrections, 7),
-            corrections=corrections,
-        )
-    return None
-
-
-def _try_ch(text: str) -> PlateResult | None:
-    """Tente de matcher au format suisse : AA 123456."""
-    text_clean = re.sub(r'[\s\-]', '', text)
-    if len(text_clean) < 3 or len(text_clean) > 8:
-        return None
-
-    corrections = 0
-    canton = list(text_clean[0:2])
-    num = list(text_clean[2:])
-
-    # Corriger canton (2 lettres)
-    corr = _correct_zone(canton, OCR_DIGIT_TO_LETTER, expect_digits=False)
-    if corr is None:
-        return None
-    corrections += corr
-
-    # Corriger numéro (1-6 chiffres)
-    corr = _correct_zone(num, OCR_LETTER_TO_DIGIT, expect_digits=True)
-    if corr is None:
-        return None
-    corrections += corr
-
-    canton_str = ''.join(canton)
-    num_str = ''.join(num)
-
-    # Vérifier que le canton est valide
-    if canton_str not in CH_CANTONS:
-        return None
-
-    if not (1 <= len(num_str) <= 6) or not num_str.isdigit():
-        return None
-
-    plate = f"{canton_str} {num_str}"
-
-    return PlateResult(
-        raw_text=text, plate=plate, format="CH",
-        confidence=_compute_confidence(corrections, len(text_clean)),
-        corrections=corrections,
-    )
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 # FONCTION PRINCIPALE
@@ -391,17 +291,15 @@ def recognize_plate(raw_text: str) -> PlateResult:
     """
     text = clean_ocr_text(raw_text)
 
-    # Essayer TOUS les formats et collecter les résultats
+    # Essayer SIV puis FNI
     candidates: list[PlateResult] = []
-    for try_fn in [_try_siv, _try_fni, _try_uk, _try_ch]:
+    for try_fn in [_try_siv, _try_fni]:
         result = try_fn(text)
         if result is not None:
             result.raw_text = raw_text
             candidates.append(result)
 
     if candidates:
-        # Retourner le candidat avec la meilleure confiance
-        # En cas d'égalité, le premier dans la liste gagne (priorité SIV > FNI > UK > CH)
         return max(candidates, key=lambda r: r.confidence)
 
     return PlateResult(
