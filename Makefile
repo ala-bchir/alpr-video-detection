@@ -284,17 +284,18 @@ eval-deepseek-ocr2:
 # ============================================
 # PIPELINE COMPLET
 # ============================================
-# Usage: make pipeline START_TIME=12:30 TIME_WINDOW=3
+# Usage: make pipeline START_TIME=12:30 TIME_WINDOW=3 FRAME_SKIP=1
 # La vidéo doit être placée dans data/videos/ (une seule vidéo)
 
 VIDEOS_DIR=data/videos
 TIME_WINDOW?=3
+FRAME_SKIP?=1
 
 pipeline:
 	@echo "🎬 Lancement du pipeline complet..."
 	@if [ -z "$(START_TIME)" ]; then \
 		echo "❌ Erreur: START_TIME est requis"; \
-		echo "Usage: make pipeline START_TIME=12:30 TIME_WINDOW=3"; \
+		echo "Usage: make pipeline START_TIME=12:30 TIME_WINDOW=3 FRAME_SKIP=1"; \
 		exit 1; \
 	fi
 	@VIDEO_FILE=$$(ls -1 $(VIDEOS_DIR)/*.mp4 $(VIDEOS_DIR)/*.avi $(VIDEOS_DIR)/*.mkv $(VIDEOS_DIR)/*.mov 2>/dev/null | head -1); \
@@ -306,8 +307,9 @@ pipeline:
 	echo "📹 Vidéo détectée: $$VIDEO_FILE"; \
 	echo "⏰ Heure de départ: $(START_TIME)"; \
 	echo "🔄 Fenêtre dédup: $(TIME_WINDOW)s"; \
+	echo "⏭️  Frame skip: $(FRAME_SKIP)"; \
 	pip install requests opencv-python --break-system-packages -q 2>/dev/null || pip install requests opencv-python -q; \
-	python3 pipeline.py --video "$$VIDEO_FILE" --start-time "$(START_TIME)" --time-window $(TIME_WINDOW)
+	python3 pipeline.py --video "$$VIDEO_FILE" --start-time "$(START_TIME)" --time-window $(TIME_WINDOW) --frame-skip $(FRAME_SKIP)
 
 # ============================================
 # NETTOYAGE

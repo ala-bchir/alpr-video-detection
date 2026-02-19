@@ -163,17 +163,21 @@ def extract_frame_number(filename):
     return 0
 
 
-def run_sam3_extraction():
+def run_sam3_extraction(frame_skip=1):
     """Exécute l'extraction SAM3 via Docker."""
     print("\n" + "=" * 60)
-    print("🔍 ÉTAPE 1: Extraction des plaques avec SAM3")
+    print(f"🔍 ÉTAPE 1: Extraction des plaques avec SAM3 (frame_skip={frame_skip})")
     print("=" * 60)
+    
+    env = os.environ.copy()
+    env["FRAME_SKIP"] = str(frame_skip)
     
     result = subprocess.run(
         ["make", "run"],
         cwd="/home/solayman/sam3_licencePlate_processing",
         capture_output=True,
-        text=True
+        text=True,
+        env=env
     )
     
     if result.returncode != 0:
@@ -440,6 +444,12 @@ def main():
         default=3,
         help="Fenêtre temporelle de déduplication en secondes (défaut: 3)"
     )
+    parser.add_argument(
+        "--frame-skip", "-f",
+        type=int,
+        default=1,
+        help="Sauter N frames entre chaque traitement SAM3 (défaut: 1 = pas de skip)"
+    )
     args = parser.parse_args()
     
     print("=" * 60)
@@ -471,7 +481,7 @@ def main():
         stop_glm_server()
     
     # Étape 1: SAM3
-    if not run_sam3_extraction():
+    if not run_sam3_extraction(frame_skip=args.frame_skip):
         print("❌ Échec de l'extraction SAM3")
         sys.exit(1)
     
@@ -530,13 +540,54 @@ def main():
     print("=" * 60)
     from dedup_plates import deduplicate
     deduplicated = deduplicate(filtered_results, fps, time_window=args.time_window)
-    print(f"📋 {len(filtered_results)} → {len(deduplicated)} plaques uniques")
+    print(f"📋 Passe 1 : {len(filtered_results)} → {len(deduplicated)} plaques")
+    
+    # Passe 2 : re-dédup après correction regex (le formatage peut révéler de nouveaux doublons)
+    deduplicated2 = deduplicate(deduplicated, fps, time_window=args.time_window)
+    print(f"📋 Passe 2 : {len(deduplicated)} → {len(deduplicated2)} plaques uniques")
     
     # Étape 7: Calcul des heures
-    final_results = calculate_passage_times(deduplicated, args.start_time, fps)
+    final_results = calculate_passage_times(deduplicated2, args.start_time, fps)
     
-    # Étape 8: Export
-    output_file = export_csv(final_results, args.video)
+    # Étape 7.5: Filtre même seconde (anti-hallucination)
+    print("\n" + "=" * 60)
+    print("🧹 ÉTAPE 7.5: Filtre même seconde (anti-hallucination)")
+    print("=" * 60)
+    FORMAT_PRIORITY = {"SIV": 0, "FNI": 1, "UNKNOWN": 2}
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for r in final_results:
+        groups[r["passage_time"]].append(r)
+    
+    cleaned = []
+    removed = 0
+    for time_key, plates in sorted(groups.items()):
+        # Garder la meilleure plaque par seconde
+        best = min(plates, key=lambda r: (
+            FORMAT_PRIORITY.get(r.get("format", "UNKNOWN"), 2),
+            r["plate"].count("*")
+        ))
+        cleaned.append(best)
+        # Afficher les hallucinations supprimées
+        for p in plates:
+            if p is not best:
+                print(f"  ❌ {time_key} | {p['plate']} [{p.get('format', '?')}] → gardé: {best['plate']} [{best.get('format', '?')}]")
+                removed += 1
+    
+    print(f"\n📋 {len(final_results)} → {len(cleaned)} plaques ({removed} hallucinations supprimées)")
+    
+    # Étape 8: Filtre doublons exacts (garder la 1ère occurrence)
+    seen = set()
+    unique = []
+    for r in cleaned:
+        if r["plate"] not in seen:
+            seen.add(r["plate"])
+            unique.append(r)
+    if len(cleaned) != len(unique):
+        print(f"\n🔁 Doublons exacts supprimés: {len(cleaned)} → {len(unique)}")
+    
+    # Étape 9: Export
+    output_file = export_csv(unique, args.video)
     
     print("\n" + "=" * 60)
     print("✅ PIPELINE TERMINÉ AVEC SUCCÈS")

@@ -25,7 +25,7 @@ LABEL_MAPPING = {
 # --- PARAMÈTRES DE FILTRAGE ---
 CONFIDENCE_THRESHOLD = 0.4  # Plus permissif pour capter plus de plaques
 MIN_BOX_AREA_THRESHOLD = 0   # Désactivé - on garde toutes les tailles
-FRAME_SKIP = 3
+FRAME_SKIP = int(os.environ.get('FRAME_SKIP', '3'))
 
 def setup_model():
     print(f"🏗️ Chargement de SAM 3 sur {DEVICE} (Mode Standard Float32)...")
