@@ -3,3 +3,4 @@ data/
 dataset/
 sam3_weights.pt
 .vscode/
+results/

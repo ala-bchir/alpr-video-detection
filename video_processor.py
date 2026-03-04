@@ -1,4 +1,5 @@
 import os
+import json
 import cv2
 import torch
 import numpy as np
@@ -26,6 +27,33 @@ LABEL_MAPPING = {
 CONFIDENCE_THRESHOLD = 0.4  # Plus permissif pour capter plus de plaques
 MIN_BOX_AREA_THRESHOLD = 0   # Désactivé - on garde toutes les tailles
 FRAME_SKIP = int(os.environ.get('FRAME_SKIP', '3'))
+
+# --- MASK ZONES (chargé via env var) ---
+def load_mask_zones():
+    """Charge les zones de masquage depuis la variable d'env MASK_ZONES (JSON)."""
+    mask_json = os.environ.get('MASK_ZONES', '')
+    if not mask_json:
+        return []
+    try:
+        zones = json.loads(mask_json)
+        if zones:
+            print(f"🎭 {len(zones)} zone(s) de masquage chargée(s)")
+        return zones
+    except json.JSONDecodeError:
+        print("⚠️ MASK_ZONES invalide, masquage désactivé")
+        return []
+
+def apply_mask(frame, mask_zones):
+    """Applique les zones de masquage (noir) sur le frame."""
+    for zone in mask_zones:
+        x1 = max(0, int(zone.get('x1', 0)))
+        y1 = max(0, int(zone.get('y1', 0)))
+        x2 = min(frame.shape[1], int(zone.get('x2', 0)))
+        y2 = min(frame.shape[0], int(zone.get('y2', 0)))
+        frame[y1:y2, x1:x2] = 0
+    return frame
+
+MASK_ZONES = load_mask_zones()
 
 def setup_model():
     print(f"🏗️ Chargement de SAM 3 sur {DEVICE} (Mode Standard Float32)...")
@@ -74,6 +102,10 @@ def process_videos():
             pbar.update(1)
 
             if frame_count % FRAME_SKIP == 0:
+                # Appliquer le masque avant traitement
+                if MASK_ZONES:
+                    frame = apply_mask(frame, MASK_ZONES)
+                
                 # Préparation de l'image
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 pil_img = Image.fromarray(rgb_frame)
