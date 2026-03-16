@@ -104,15 +104,37 @@ def discover_postes(base_dir, filter_postes=None):
 def discover_videos(poste_dir):
     """
     Découvre toutes les vidéos .avi dans un dossier de poste.
+    Recherche récursive dans les sous-dossiers (ex: 20260228_07/).
     Retourne une liste triée de chemins absolus vers les fichiers vidéo.
     """
     videos = []
-    for f in sorted(os.listdir(poste_dir)):
-        if f.lower().endswith(('.avi', '.mp4', '.mkv', '.mov')):
-            full_path = os.path.join(poste_dir, f)
-            if os.path.isfile(full_path):
-                videos.append(full_path)
-    return videos
+    for root, dirs, files in os.walk(poste_dir):
+        for f in files:
+            if f.lower().endswith(('.avi', '.mp4', '.mkv', '.mov')):
+                videos.append(os.path.join(root, f))
+    return sorted(videos)
+
+
+def get_video_direction(filename):
+    """
+    Retourne le sens ('1' ou '2') selon le préfixe du nom de fichier.
+    Retourne None si le fichier ne commence pas par '1_' ou '2_'.
+    """
+    basename = os.path.basename(filename)
+    if basename.startswith("1_"):
+        return "1"
+    elif basename.startswith("2_"):
+        return "2"
+    return None
+
+
+def is_dual_direction(videos):
+    """
+    Détecte si un poste est à double sens (contient des vidéos 1_ et 2_).
+    """
+    has_1 = any(get_video_direction(v) == "1" for v in videos)
+    has_2 = any(get_video_direction(v) == "2" for v in videos)
+    return has_1 and has_2
 
 
 def load_mask_config(poste_dir):
@@ -149,6 +171,22 @@ def extract_frame_number(filename):
     if match:
         return int(match.group(1))
     return 0
+
+
+def extract_vehicle_category(filename):
+    """
+    Extrait la catégorie de véhicule depuis le nom du fichier crop.
+    Format attendu: plaque_f{frame}_{timestamp}_{CATEGORY}.jpg
+    Catégories possibles: VL, PL, MOTO, BUS, VAN, INCONNU
+    """
+    # Chercher le dernier segment avant l'extension
+    name_no_ext = os.path.splitext(filename)[0]
+    parts = name_no_ext.split('_')
+    if parts:
+        last_part = parts[-1].upper()
+        if last_part in ('VL', 'PL', 'MOTO', 'BUS', 'VAN', 'INCONNU'):
+            return last_part
+    return "INCONNU"
 
 
 # ============== GLM-OCR SERVER ==============
@@ -349,7 +387,8 @@ def run_glm_ocr():
             results.append({
                 "filename": filename,
                 "plate": plate_text,
-                "frame": extract_frame_number(filename)
+                "frame": extract_frame_number(filename),
+                "category": extract_vehicle_category(filename)
             })
         except Exception as e:
             print(f"   ❌ Erreur OCR sur {filename}: {e}")
@@ -412,7 +451,9 @@ def calculate_timestamps(results, start_datetime, fps):
             "timestamp": passage_time.strftime("%H:%M:%S"),
             "plate": r["plate"],
             "format": r.get("format", "UNKNOWN"),
-            "frame": r["frame"]
+            "frame": r["frame"],
+            "category": r.get("category", "INCONNU"),
+            "filename": r.get("filename", "")
         })
     return final
 
@@ -550,7 +591,7 @@ def export_poste_csv(poste_name, all_results):
                 poste_name,
                 r["date"],
                 r["timestamp"],
-                "VL",
+                r.get("category", "INCONNU"),
                 r["plate"]
             ])
 
@@ -562,11 +603,63 @@ def export_poste_csv(poste_name, all_results):
         print("\n📋 Aperçu (5 premières lignes):")
         print("-" * 60)
         for r in all_results[:5]:
-            print(f"  {poste_name} | {r['date']} | {r['timestamp']} | VL | {r['plate']}")
+            print(f"  {poste_name} | {r['date']} | {r['timestamp']} | {r.get('category', 'INCONNU')} | {r['plate']}")
         if len(all_results) > 5:
             print(f"  ... et {len(all_results) - 5} autres")
 
     return output_file
+
+
+def export_poste_csv_dual(poste_name, all_results):
+    """
+    Exporte les résultats d'un poste double-sens dans deux CSV séparés.
+    Un fichier par sens : batch_{poste}_sens1_*.csv et batch_{poste}_sens2_*.csv
+    Colonnes: Poste, Date, Timestamp, Categorie, Plaque
+    """
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # Séparer les résultats par direction
+    sens1 = [r for r in all_results if r.get("direction") == "1"]
+    sens2 = [r for r in all_results if r.get("direction") == "2"]
+
+    output_files = []
+
+    for sens_label, sens_results in [("sens1", sens1), ("sens2", sens2)]:
+        if not sens_results:
+            print(f"\n⚠️  {poste_name} {sens_label}: aucun résultat")
+            continue
+
+        sens_results.sort(key=lambda r: (r["date"], r["timestamp"]))
+        output_file = os.path.join(RESULTS_DIR, f"batch_{poste_name}_{sens_label}_{timestamp}.csv")
+
+        with open(output_file, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(["Poste", "Sens", "Date", "Timestamp", "Categorie", "Plaque"])
+
+            for r in sens_results:
+                writer.writerow([
+                    poste_name,
+                    r.get("direction", "?"),
+                    r["date"],
+                    r["timestamp"],
+                    r.get("category", "INCONNU"),
+                    r["plate"]
+                ])
+
+        output_files.append(output_file)
+        print(f"\n📄 CSV exporté ({sens_label}): {output_file}")
+        print(f"📊 {sens_label}: {len(sens_results)} plaques")
+
+        # Aperçu
+        print(f"\n📋 Aperçu {sens_label} (5 premières lignes):")
+        print("-" * 70)
+        for r in sens_results[:5]:
+            print(f"  {poste_name} | S{r.get('direction', '?')} | {r['date']} | {r['timestamp']} | {r.get('category', 'INCONNU')} | {r['plate']}")
+        if len(sens_results) > 5:
+            print(f"  ... et {len(sens_results) - 5} autres")
+
+    return output_files
 
 
 # ============== MAIN ==============
@@ -623,6 +716,7 @@ def main():
 
     # Découvrir les vidéos par poste
     poste_videos = {}
+    poste_dual = {}  # True si le poste est à double sens
     total_videos = 0
     for poste_name, poste_dir in postes:
         videos = discover_videos(poste_dir)
@@ -633,8 +727,11 @@ def main():
             if date_str:
                 valid_videos.append(v)
         poste_videos[poste_name] = valid_videos
+        dual = is_dual_direction(valid_videos)
+        poste_dual[poste_name] = dual
         total_videos += len(valid_videos)
-        print(f"   📁 {poste_name}: {len(valid_videos)} vidéo(s)")
+        dual_label = " ↔️ double-sens" if dual else ""
+        print(f"   📁 {poste_name}: {len(valid_videos)} vidéo(s){dual_label}")
 
     if total_videos == 0:
         print("❌ Aucune vidéo valide trouvée")
@@ -646,12 +743,15 @@ def main():
         print("🔍 MODE DRY-RUN — Liste des vidéos détectées")
         print("=" * 70)
         for poste_name, videos in poste_videos.items():
-            print(f"\n📁 {poste_name} ({len(videos)} vidéos):")
+            dual_label = " ↔️ double-sens" if poste_dual.get(poste_name) else ""
+            print(f"\n📁 {poste_name} ({len(videos)} vidéos){dual_label}:")
             for v in videos:
                 vname = os.path.basename(v)
                 date_str, start_dt = parse_video_name(vname)
                 size_mb = os.path.getsize(v) / (1024 * 1024)
-                print(f"   🎥 {vname} | {date_str} {start_dt.strftime('%H:%M:%S')} | {size_mb:.0f} MB")
+                direction = get_video_direction(v)
+                dir_label = f" [Sens {direction}]" if direction else ""
+                print(f"   🎥 {vname}{dir_label} | {date_str} {start_dt.strftime('%H:%M:%S')} | {size_mb:.0f} MB")
         print(f"\n📊 Total: {total_videos} vidéos dans {len(postes)} postes")
         print("✅ Dry-run terminé (aucun traitement effectué)")
         return
@@ -871,7 +971,8 @@ def main():
                     ocr_results.append({
                         "filename": filename,
                         "plate": plate_text,
-                        "frame": extract_frame_number(filename)
+                        "frame": extract_frame_number(filename),
+                        "category": extract_vehicle_category(filename)
                     })
                 except Exception as e:
                     pass  # Silencieux pour la vitesse
@@ -893,6 +994,33 @@ def main():
             cleaned = apply_same_second_filter(timestamped)
             unique = remove_exact_duplicates(cleaned)
 
+            # Renommer les crops avec le texte de la plaque
+            renamed_count = 0
+            for r in unique:
+                old_filename = r.get("filename", "")
+                if old_filename:
+                    old_path = os.path.join(vinfo["crops_dir"], old_filename)
+                    if os.path.exists(old_path):
+                        # Construire le nouveau nom : PLATE_f{frame}_{timestamp}_{CATEGORY}.jpg
+                        plate_safe = r["plate"].replace("*", "_")
+                        ext = os.path.splitext(old_filename)[1]
+                        category = r.get("category", "INCONNU")
+                        new_filename = f"{plate_safe}_f{r['frame']}_{category}{ext}"
+                        new_path = os.path.join(vinfo["crops_dir"], new_filename)
+                        try:
+                            os.rename(old_path, new_path)
+                            r["filename"] = new_filename
+                            renamed_count += 1
+                        except OSError:
+                            pass  # En cas de conflit de nom, on garde l'original
+            if renamed_count > 0:
+                log_progress(f"   📝 {renamed_count} crops renommés avec le texte de la plaque")
+
+            # Ajouter la direction (sens) à chaque résultat
+            video_direction = get_video_direction(vinfo["video_name"])
+            for r in unique:
+                r["direction"] = video_direction
+
             poste_results.extend(unique)
             log_progress(f"   📊 {len(unique)} plaques uniques (total poste: {len(poste_results)})")
 
@@ -902,9 +1030,17 @@ def main():
         # ── Export CSV pour ce poste ──
         poste_dur = time.time() - poste_start
         if poste_results:
-            csv_path = export_poste_csv(poste_name, poste_results)
-            generated_csvs.append(csv_path)
-            log_progress(f"\n✅ Poste {poste_name}: {len(poste_results)} plaques en {fmt_duration(poste_dur)}")
+            if poste_dual.get(poste_name):
+                # Export double-sens : deux CSV séparés
+                csv_paths = export_poste_csv_dual(poste_name, poste_results)
+                generated_csvs.extend(csv_paths)
+                sens1_count = sum(1 for r in poste_results if r.get("direction") == "1")
+                sens2_count = sum(1 for r in poste_results if r.get("direction") == "2")
+                log_progress(f"\n✅ Poste {poste_name} (double-sens): {len(poste_results)} plaques (S1:{sens1_count} S2:{sens2_count}) en {fmt_duration(poste_dur)}")
+            else:
+                csv_path = export_poste_csv(poste_name, poste_results)
+                generated_csvs.append(csv_path)
+                log_progress(f"\n✅ Poste {poste_name}: {len(poste_results)} plaques en {fmt_duration(poste_dur)}")
         else:
             log_progress(f"\n⚠️  Poste {poste_name}: aucun résultat ({fmt_duration(poste_dur)})")
 

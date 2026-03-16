@@ -23,6 +23,15 @@ LABEL_MAPPING = {
     "plaque2": "number plate",
 }
 
+# Catégories de véhicules à détecter (label CSV → prompt SAM3)
+VEHICLE_MAPPING = {
+    "VL": "car",
+    "PL": "truck",
+    "MOTO": "motorcycle",
+    "BUS": "bus",
+    "VAN": "van",
+}
+
 # --- PARAMÈTRES DE FILTRAGE ---
 CONFIDENCE_THRESHOLD = 0.4  # Plus permissif pour capter plus de plaques
 MIN_BOX_AREA_THRESHOLD = 0   # Désactivé - on garde toutes les tailles
@@ -143,6 +152,27 @@ def process_videos():
                                     best_detection = {'label': ls_label, 'score': score_val, 'ratio': ratio, 'box': box}
 
                     if best_detection:
+                        # --- Détection du type de véhicule ---
+                        vehicle_category = "INCONNU"
+                        best_vehicle = None
+                        try:
+                            for v_label, v_prompt in VEHICLE_MAPPING.items():
+                                v_output = processor.set_text_prompt(state=inference_state, prompt=v_prompt)
+                                v_boxes = v_output.get("boxes")
+                                v_scores = v_output.get("scores")
+                                if v_boxes is not None and len(v_boxes) > 0:
+                                    v_scores_np = v_scores.float().cpu().numpy()
+                                    max_idx = v_scores_np.argmax()
+                                    v_score_val = float(v_scores_np[max_idx])
+                                    if v_score_val >= CONFIDENCE_THRESHOLD:
+                                        if best_vehicle is None or v_score_val > best_vehicle['score']:
+                                            best_vehicle = {'label': v_label, 'score': v_score_val}
+                        except Exception as e:
+                            tqdm.write(f"⚠️ Erreur détection véhicule frame {frame_count}: {e}")
+
+                        if best_vehicle:
+                            vehicle_category = best_vehicle['label']
+
                         # Crop de la zone de la plaque détectée
                         x1, y1, x2, y2 = map(int, best_detection['box'])
                         # S'assurer que les coordonnées sont dans les limites de l'image
@@ -151,7 +181,7 @@ def process_videos():
                         plate_crop = frame[y1:y2, x1:x2]
                         
                         timestamp = datetime.now().strftime("%H%M%S")
-                        filename = f"{best_detection['label']}_f{frame_count}_{timestamp}.jpg"
+                        filename = f"{best_detection['label']}_f{frame_count}_{timestamp}_{vehicle_category}.jpg"
                         
                         # Sauvegarder l'image entière dans data/images
                         cv2.imwrite(os.path.join(OUTPUT_IMAGES_DIR, filename), frame)
@@ -159,8 +189,21 @@ def process_videos():
                         # Sauvegarder le crop de la plaque dans data/crop
                         cv2.imwrite(os.path.join(OUTPUT_CROP_DIR, filename), plate_crop)
                         
+                        # Enregistrer dans detections.json
+                        detections_file = os.path.join(OUTPUT_CROP_DIR, "detections.json")
+                        detections = {}
+                        if os.path.exists(detections_file):
+                            try:
+                                with open(detections_file, 'r') as df:
+                                    detections = json.load(df)
+                            except (json.JSONDecodeError, IOError):
+                                pass
+                        detections[filename] = vehicle_category
+                        with open(detections_file, 'w') as df:
+                            json.dump(detections, df, indent=2)
+                        
                         saved_count += 1
-                        tqdm.write(f"📸 Plaque capturée : {best_detection['label']} (conf: {best_detection['score']:.1%})")
+                        tqdm.write(f"📸 Plaque capturée : {best_detection['label']} (conf: {best_detection['score']:.1%}) | Véhicule: {vehicle_category}")
                 
                 except Exception as e:
                     tqdm.write(f"❌ Erreur sur la frame {frame_count}: {e}")

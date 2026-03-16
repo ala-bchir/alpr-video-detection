@@ -50,6 +50,18 @@ sort:
 		$(IMAGE_NAME) python /app/auto_sort_plates.py
 
 # ============================================
+# EXTRACTION DE VÉHICULES
+# ============================================
+extract-vehicles:
+	docker run --rm --gpus all \
+		--ipc=host \
+		-v $(PWD)/data/videos:/app/data/videos \
+		-v $(PWD)/data/vehicle_frames:/app/data/vehicle_frames \
+		-v $(PWD)/sam3_weights.pt:/app/sam3_weights.pt \
+		-v $(PWD)/extract_vehicles.py:/app/extract_vehicles.py \
+		$(IMAGE_NAME) python3 /app/extract_vehicles.py
+
+# ============================================
 # QWEN VL - Vision Language Models pour OCR
 # ============================================
 
