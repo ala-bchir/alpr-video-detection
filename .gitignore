@@ -4,3 +4,4 @@ dataset/
 sam3_weights.pt
 .vscode/
 results/
+LAPI_Lorient2/

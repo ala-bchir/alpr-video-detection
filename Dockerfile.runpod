@@ -1,0 +1,93 @@
+# =============================================================
+# Dockerfile.runpod — Image complète pour le worker cloud RunPod
+# =============================================================
+
+FROM nvcr.io/nvidia/pytorch:24.03-py3
+
+WORKDIR /app
+
+# ── 1. Dépendances système ─────────────────────────────────────
+RUN apt-get update && apt-get install -y \
+    git curl unzip ffmpeg libgl1 libglib2.0-0 libgomp1 sed \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── 2. rclone (client WebDAV pour Nextcloud) ──────────────────
+RUN curl https://rclone.org/install.sh | bash
+
+# ── 3. L'Opération Terre Brûlée (Nettoyage OpenCV) ────────────
+# Élimine la version corrompue de NVIDIA AVANT d'installer la nouvelle
+RUN rm -rf /usr/local/lib/python3.10/dist-packages/cv2 \
+    && rm -rf /usr/local/lib/python3.10/dist-packages/opencv_*
+
+# ── 4. Installation de vLLM ───────────────────────────────────
+# Installe vLLM, qui va amener proprement Numpy 2.x et OpenCV 4.13+
+RUN pip install --no-cache-dir vllm
+
+# ── 4b. Recompilation de flash-attn ───────────────────────────
+# Le binaire pré-compilé flash-attn est lié à un PyTorch ABI différent
+# de celui de l'image NVIDIA → undefined symbol _ZN3c104cuda9SetDeviceEi
+# --force-reinstall force la recompilation depuis les sources.
+RUN pip install --no-cache-dir --force-reinstall flash-attn --no-build-isolation
+
+# ── 5. La Recompilation de Soxr (Votre correctif vital) ───────
+# Fixe le crash "numpy.core.multiarray failed to import" dû à Numpy 2.x
+RUN pip install --no-cache-dir --force-reinstall --no-binary=soxr soxr
+
+# ── 6. Sécurité + dépendances SAM3 (sans numpy<2) ────────────
+# SAM3 est installé avec --no-deps pour ne pas casser Numpy 2.x
+# On installe donc ses dépendances manuellement ici
+RUN pip install --no-cache-dir --upgrade scipy contourpy \
+    "iopath>=0.1.10" "ftfy==6.1.1" "timm>=1.0.17" regex
+
+# ── 7. Dépendances Python du projet ──────────────────────────
+COPY requirements.txt .
+RUN pip install --no-cache-dir \
+    $(grep -ivE "torch|torchvision|torchaudio|opencv|numpy" requirements.txt)
+
+RUN pip install --no-cache-dir openai requests
+
+# ── 8. SAM3 ───────────────────────────────────────────────────
+RUN git clone https://github.com/facebookresearch/sam3.git /app/sam3_repo
+# --no-deps permet d'installer SAM3 sans qu'il ne détruise Numpy 2.x
+RUN pip install --no-cache-dir --no-deps -e /app/sam3_repo
+
+# ── 8a. Patch fused.py — Désactiver le cast bf16 forcé ────────
+# La fonction addmm_act de Meta force tous les tenseurs en bfloat16
+# pour un kernel CUDA fusionné. En cohabitation avec vLLM (cuDNN
+# indisponible, modèle en float32), ça provoque un crash dtype.
+# On remplace par un fallback standard linear + activation.
+RUN printf '%s\n' \
+    '# Patched: removed forced bfloat16 cast for float32 inference' \
+    'import torch' \
+    '' \
+    'def addmm_act(activation, linear, mat1):' \
+    '    x = torch.nn.functional.linear(mat1, linear.weight, linear.bias)' \
+    '    if activation in [torch.nn.functional.gelu, torch.nn.GELU]:' \
+    '        return torch.nn.functional.gelu(x)' \
+    '    if activation in [torch.nn.functional.relu, torch.nn.ReLU]:' \
+    '        return torch.nn.functional.relu(x)' \
+    '    raise ValueError(f"Unexpected activation {activation}")' \
+    > /app/sam3_repo/sam3/perflib/fused.py
+
+# ── 8b. Transformers (AFTER SAM3 to prevent downgrade) ────────
+# glm_ocr model type requires transformers >= 5.0.0
+RUN pip install --no-cache-dir --upgrade "transformers>=5.0.0"
+
+ENV PYTHONPATH="/app/sam3_repo"
+
+# ── 9. Répertoires de travail ─────────────────────────────────
+RUN mkdir -p /app/data/videos /app/data/images /app/data/crop \
+    /app/data/clean_plates /app/data/corrected_plates \
+    /app/data/work_video /app/data/tmp_h265 /app/results
+
+# ── 10. Scripts & Poids ───────────────────────────────────────
+COPY video_processor.py   .
+COPY batch_processor.py   .
+COPY auto_sort_plates.py  .
+COPY homography.py        .
+COPY regex_augmente.py    .
+COPY dedup_plates.py      .
+COPY worker.py            .
+COPY sam3_weights.pt      .
+
+CMD ["python3", "worker.py"]

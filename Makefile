@@ -15,7 +15,58 @@ QWEN_2B_OCR=prithivMLmods/Qwen2-VL-OCR-2B-Instruct
 GLM_OCR=zai-org/GLM-OCR
 ROLM_OCR=reducto/RolmOCR
 
-.PHONY: build run all clean sort stop-vlm start-qwen-7b start-qwen-2b-ocr label-7b label-2b-ocr
+.PHONY: build run all clean sort stop-vlm start-qwen-7b start-qwen-2b-ocr label-7b label-2b-ocr \
+        build-runpod push-runpod test-runpod
+
+# ============================================
+# RUNPOD — Worker Cloud (Étapes 3 & 4)
+# ============================================
+# Image combinée SAM3 + vLLM/GLM-OCR + rclone
+# Usage:
+#   make build-runpod DOCKER_USER=ton_compte
+#   make push-runpod  DOCKER_USER=ton_compte
+#   make test-runpod  DOCKER_USER=ton_compte NEXTCLOUD_URL=https://... (autres vars)
+
+RUNPOD_IMAGE_NAME ?= alpr-runpod-worker
+GHCR_USER         ?= ala-bchir
+GHCR_IMAGE         = ghcr.io/$(GHCR_USER)/$(RUNPOD_IMAGE_NAME)
+
+# --- GHCR (GitHub Container Registry) ---
+
+build-runpod:
+	@echo "🔨 Build de l'image RunPod (peut prendre 20-30 min la première fois)..."
+	docker build -f Dockerfile.runpod -t $(GHCR_IMAGE):latest .
+	@echo "✅ Image prête : $(GHCR_IMAGE):latest"
+
+login-ghcr:
+	@echo "🔐 Connexion à GitHub Container Registry..."
+	@echo "   → Va sur https://github.com/settings/tokens/new"
+	@echo "   → Coche: write:packages, read:packages, delete:packages"
+	@echo "   → Copie le token et lance:"
+	@echo "   echo 'ghp_TON_TOKEN' | docker login ghcr.io -u $(GHCR_USER) --password-stdin"
+
+push-runpod:
+	@echo "📤 Push vers GitHub Container Registry..."
+	docker push $(GHCR_IMAGE):latest
+	@echo "✅ Image disponible sur GHCR"
+	@echo "   → Sur RunPod, utilise l'image : $(GHCR_IMAGE):latest"
+
+# Test local du worker (simule ce que RunPod fait au démarrage)
+# Nécessite un GPU et les variables d'environnement Nextcloud
+test-runpod:
+	@echo "🧪 Test local du worker RunPod..."
+	@echo "⚠️  Variables requises: NEXTCLOUD_URL, NEXTCLOUD_USER, NEXTCLOUD_PASS, POSTE_NAME"
+	docker run --rm --gpus all \
+		--ipc=host \
+		-e NEXTCLOUD_URL=$(NEXTCLOUD_URL) \
+		-e NEXTCLOUD_USER=$(NEXTCLOUD_USER) \
+		-e NEXTCLOUD_PASS=$(NEXTCLOUD_PASS) \
+		-e NEXTCLOUD_VIDEOS_DIR=$(NEXTCLOUD_VIDEOS_DIR) \
+		-e NEXTCLOUD_RESULTS_DIR=$(NEXTCLOUD_RESULTS_DIR) \
+		-e POSTE_NAME=$(POSTE_NAME) \
+		-e FRAME_SKIP=$(or $(FRAME_SKIP),3) \
+		-e MAX_VIDEOS=$(or $(MAX_VIDEOS),1) \
+		$(GHCR_IMAGE):latest
 
 # ============================================
 # COMMANDES GÉNÉRALES

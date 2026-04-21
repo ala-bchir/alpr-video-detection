@@ -1,0 +1,35 @@
+7:30-9:30/10 - 16:30-18:30
+
+&6XPHO!d0TNlXK
+
+
+
+https://cloud.itecmobility.com/remote.php/dav/files/Ala , Ala , 24z4k-HjLyC-Ab9kF-mfYX2-arEbg
+
+rclone copy "/media/solayman/Elements/LAPI Lorient/LAPI_Lorient2" nextcloud:lorient -P
+
+
+double sens : 
+9
+15
+28
+31
+11
+
+
+
+illisible :
+s47
+
+
+1:55.9
+2:56.7
+3:66.3
+4:55.9
+5:43
+
+double
+1:25.9
+2:14.7
+3:10.5
+

@@ -5,7 +5,9 @@ Batch Processor — Traitement multi-vidéos / multi-postes.
 Scanne data/videos/ pour trouver les dossiers de postes (CA1, CA3, CA4, …),
 traite toutes les vidéos de chaque poste et génère un CSV par poste.
 
-Format vidéo attendu : 2_YYYYMMDD_HHMMSS_0025d5.avi
+Formats vidéo acceptés :
+  - AVI : 2_YYYYMMDD_HHMMSS_0025d5.avi
+  - H.265 : U20260310-06584419N100.265
   → La date et l'heure de début sont extraites du nom du fichier.
 
 Colonnes CSV : Poste, Date, Timestamp, Categorie, Plaque
@@ -42,6 +44,8 @@ CLEAN_DIR = os.path.join(DATA_DIR, "clean_plates")
 CORRECTED_DIR = os.path.join(DATA_DIR, "corrected_plates")
 WORK_VIDEO_DIR = os.path.join(DATA_DIR, "work_video")  # Dossier temporaire pour SAM3
 CROPS_BASE_DIR = os.path.join(DATA_DIR, "crops_per_video")  # Crops isolés par vidéo
+IMAGES_DIR = os.path.join(DATA_DIR, "images")               # Photos entières (SAM3)
+FRAMES_BASE_DIR = os.path.join(DATA_DIR, "frames_per_poste")  # Frames entières par poste
 RESULTS_DIR = os.path.join(BASE_DIR, "results")
 
 VLLM_URL = "http://localhost:8000/v1"
@@ -49,7 +53,7 @@ GLM_MODEL = "zai-org/GLM-OCR"
 
 MIN_PLATE_LENGTH = 5
 STANDARD_PLATE_LENGTH = 7
-MAX_PLATE_LENGTH = 10
+MAX_PLATE_LENGTH = 8
 
 OCR_PROMPT = """Read the license plate in this image.
 Output ONLY the plate text in uppercase (letters and numbers only, no spaces or dashes).
@@ -62,16 +66,28 @@ VIDEO_NAME_PATTERN = re.compile(
     re.IGNORECASE
 )
 
+# Regex pour parser le H.265 : U20260310-06584419N100.265
+VIDEO_H265_PATTERN = re.compile(
+    r'^U(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})\d*N\d+\.265$',
+    re.IGNORECASE
+)
+
 
 # ============== UTILITAIRES ==============
 
 def parse_video_name(filename):
     """
     Parse le nom de la vidéo pour extraire la date et l'heure de début.
-    Format: 2_YYYYMMDD_HHMMSS_0025d5.avi
+    Formats supportés:
+      - AVI : 2_YYYYMMDD_HHMMSS_0025d5.avi
+      - H.265 : U20260310-06584419N100.265
     Retourne (date_str, start_datetime) ou (None, None) si le parsing échoue.
     """
+    # Essayer le format AVI classique
     match = VIDEO_NAME_PATTERN.match(filename)
+    if not match:
+        # Essayer le format H.265
+        match = VIDEO_H265_PATTERN.match(filename)
     if not match:
         return None, None
 
@@ -103,14 +119,15 @@ def discover_postes(base_dir, filter_postes=None):
 
 def discover_videos(poste_dir):
     """
-    Découvre toutes les vidéos .avi dans un dossier de poste.
+    Découvre toutes les vidéos dans un dossier de poste.
     Recherche récursive dans les sous-dossiers (ex: 20260228_07/).
+    Formats supportés: .avi, .mp4, .mkv, .mov, .265
     Retourne une liste triée de chemins absolus vers les fichiers vidéo.
     """
     videos = []
     for root, dirs, files in os.walk(poste_dir):
         for f in files:
-            if f.lower().endswith(('.avi', '.mp4', '.mkv', '.mov')):
+            if f.lower().endswith(('.avi', '.mp4', '.mkv', '.mov', '.265')):
                 videos.append(os.path.join(root, f))
     return sorted(videos)
 
@@ -253,10 +270,48 @@ def wait_for_glm_server(timeout=180):
 
 def clean_work_directories():
     """Nettoie les répertoires de travail entre chaque vidéo."""
-    for dir_path in [CROP_DIR, CLEAN_DIR, CORRECTED_DIR, WORK_VIDEO_DIR]:
+    for dir_path in [CROP_DIR, CLEAN_DIR, CORRECTED_DIR, WORK_VIDEO_DIR, IMAGES_DIR]:
         if os.path.exists(dir_path):
             shutil.rmtree(dir_path)
         os.makedirs(dir_path, exist_ok=True)
+
+
+def convert_h265_to_mp4(video_path):
+    """
+    Convertit un fichier H.265 brut (.265) en MP4 via ffmpeg.
+    Le fichier MP4 est créé dans un dossier temporaire.
+    Retourne le chemin du fichier MP4 converti, ou None en cas d'erreur.
+    """
+    tmp_dir = os.path.join(DATA_DIR, "tmp_h265")
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    basename = os.path.splitext(os.path.basename(video_path))[0]
+    mp4_path = os.path.join(tmp_dir, f"{basename}.mp4")
+
+    # Si déjà converti, réutiliser
+    if os.path.exists(mp4_path):
+        print(f"   ♻️  Fichier déjà converti: {os.path.basename(mp4_path)}")
+        return mp4_path
+
+    print(f"   🔄 Conversion H.265 → MP4...")
+    result = subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-i", video_path,
+            "-c:v", "copy",      # Remux sans réencodage (très rapide)
+            "-an",               # Pas d'audio
+            mp4_path
+        ],
+        capture_output=True, text=True
+    )
+
+    if result.returncode != 0:
+        print(f"   ❌ Erreur conversion ffmpeg: {result.stderr[:300]}")
+        return None
+
+    size_mb = os.path.getsize(mp4_path) / (1024 * 1024)
+    print(f"   ✅ Converti: {os.path.basename(mp4_path)} ({size_mb:.0f} MB)")
+    return mp4_path
 
 
 def prepare_video_for_sam3(video_path):
@@ -397,17 +452,43 @@ def run_glm_ocr():
     return results
 
 
+def _has_letters_and_digits(plate_text):
+    """Vérifie qu'une plaque contient à la fois des lettres ET des chiffres (ignore *)."""
+    clean = plate_text.replace("*", "")
+    has_letter = any(c.isalpha() for c in clean)
+    has_digit = any(c.isdigit() for c in clean)
+    return has_letter and has_digit
+
+
 def apply_filters(ocr_results):
-    """Applique le filtre de longueur et le padding."""
+    """Applique les filtres de validation des plaques.
+
+    Règles :
+      1. Longueur entre MIN_PLATE_LENGTH et MAX_PLATE_LENGTH (8)
+      2. Doit contenir au moins une lettre ET un chiffre
+         (les plaques 100% lettres ou 100% chiffres sont rejetées)
+      3. Padding avec '*' si < STANDARD_PLATE_LENGTH
+    """
+    initial_count = len(ocr_results)
+
+    # Filtre longueur
     filtered = [r for r in ocr_results
                 if MIN_PLATE_LENGTH <= len(r["plate"]) <= MAX_PLATE_LENGTH]
+    rejected_length = initial_count - len(filtered)
 
+    # Filtre alphanumérique : doit contenir lettres ET chiffres
+    before_alpha = len(filtered)
+    filtered = [r for r in filtered if _has_letters_and_digits(r["plate"])]
+    rejected_alpha = before_alpha - len(filtered)
+
+    # Padding
     for r in filtered:
         if len(r["plate"]) < STANDARD_PLATE_LENGTH:
             missing = STANDARD_PLATE_LENGTH - len(r["plate"])
             r["plate"] = r["plate"] + "*" * missing
 
-    print(f"   📋 Filtre longueur: {len(filtered)}/{len(ocr_results)}")
+    print(f"   📋 Filtres: {len(filtered)}/{initial_count} conservées "
+          f"(rejetées: {rejected_length} longueur, {rejected_alpha} non-alphanum)")
     return filtered
 
 
@@ -481,13 +562,19 @@ def apply_same_second_filter(results):
     return cleaned
 
 
+def _normalize_plate(plate_text):
+    """Normalise une plaque pour la comparaison (supprime tirets, espaces, *)."""
+    return re.sub(r'[\s\-*]', '', plate_text.upper())
+
+
 def remove_exact_duplicates(results):
-    """Supprime les doublons exacts (même texte de plaque)."""
+    """Supprime les doublons exacts (même texte de plaque, normalisé sans tirets/espaces)."""
     seen = set()
     unique = []
     for r in results:
-        if r["plate"] not in seen:
-            seen.add(r["plate"])
+        normalized = _normalize_plate(r["plate"])
+        if normalized not in seen:
+            seen.add(normalized)
             unique.append(r)
     if len(results) != len(unique):
         print(f"   🔁 Doublons exacts: {len(results)} → {len(unique)}")
@@ -509,6 +596,15 @@ def process_single_video(video_path, frame_skip=1, time_window=3, glm_ready=Fals
         return []
 
     print(f"\n   📹 {video_name} (début: {start_dt.strftime('%H:%M:%S')})")
+
+    # Conversion H.265 si nécessaire
+    converted_mp4 = None
+    if video_path.lower().endswith('.265'):
+        converted_mp4 = convert_h265_to_mp4(video_path)
+        if not converted_mp4:
+            print(f"   ❌ Impossible de convertir {video_name}, ignoré")
+            return []
+        video_path = converted_mp4
 
     # Nettoyer les dossiers de travail
     clean_work_directories()
@@ -839,7 +935,18 @@ def main():
             video_start = time.time()
 
             date_str, start_dt = parse_video_name(video_name)
-            fps = get_video_fps(video_path)
+
+            # Conversion H.265 si nécessaire
+            actual_video_path = video_path
+            if video_path.lower().endswith('.265'):
+                converted = convert_h265_to_mp4(video_path)
+                if not converted:
+                    log_progress(f"   ❌ Impossible de convertir {video_name}, ignoré")
+                    video_times.append(time.time() - video_start)
+                    continue
+                actual_video_path = converted
+
+            fps = get_video_fps(actual_video_path)
 
             # Progress bar
             progress_pct = (vid_idx / len(videos)) * 100
@@ -859,7 +966,7 @@ def main():
 
             # Nettoyer les dossiers de travail
             clean_work_directories()
-            prepare_video_for_sam3(video_path)
+            prepare_video_for_sam3(actual_video_path)
 
             # SAM3
             log_progress(f"   🔍 SAM3 (frame_skip={args.frame_skip})...")
@@ -895,6 +1002,16 @@ def main():
                     shutil.copy2(os.path.join(CORRECTED_DIR, f), os.path.join(video_crop_dir, f))
                     corrected_count += 1
 
+            # Sauvegarder les frames entières (data/images/) par vidéo
+            video_frames_dir = os.path.join(poste_crops_dir, video_base + "_frames")
+            os.makedirs(video_frames_dir, exist_ok=True)
+            frames_count = 0
+            if os.path.exists(IMAGES_DIR):
+                for f in os.listdir(IMAGES_DIR):
+                    if f.lower().endswith(('.jpg', '.png', '.jpeg')):
+                        shutil.copy2(os.path.join(IMAGES_DIR, f), os.path.join(video_frames_dir, f))
+                        frames_count += 1
+
             video_dur = time.time() - video_start
             video_times.append(video_dur)
 
@@ -902,13 +1019,14 @@ def main():
                 videos_with_crops.append({
                     "video_path": video_path,
                     "crops_dir": video_crop_dir,
+                    "frames_dir": video_frames_dir,
                     "video_name": video_name,
                     "fps": fps,
                     "date_str": date_str,
                     "start_dt": start_dt,
                     "crop_count": corrected_count
                 })
-                log_progress(f"   ✅ {corrected_count} crops sauvegardés ({fmt_duration(video_dur)})")
+                log_progress(f"   ✅ {corrected_count} crops + {frames_count} frames sauvegardés ({fmt_duration(video_dur)})")
             else:
                 log_progress(f"   ⏭️  Aucun crop valide ({fmt_duration(video_dur)})")
 
@@ -1015,6 +1133,37 @@ def main():
                             pass  # En cas de conflit de nom, on garde l'original
             if renamed_count > 0:
                 log_progress(f"   📝 {renamed_count} crops renommés avec le texte de la plaque")
+
+            # Copier les frames entières dans un dossier par poste avec le nom de la plaque
+            poste_frames_dir = os.path.join(FRAMES_BASE_DIR, poste_name)
+            os.makedirs(poste_frames_dir, exist_ok=True)
+            frames_dir = vinfo.get("frames_dir", "")
+            frames_copied = 0
+            if frames_dir and os.path.exists(frames_dir):
+                for r in unique:
+                    old_filename = r.get("filename", "")
+                    if not old_filename:
+                        continue
+                    # Le nom original avant renommage (crop et frame ont le même nom initial)
+                    # Retrouver le fichier frame correspondant par le numéro de frame
+                    frame_num = r.get("frame", 0)
+                    plate_safe = r["plate"].replace("*", "_")
+                    category = r.get("category", "INCONNU")
+                    # Chercher la frame correspondante dans le dossier frames
+                    for ff in os.listdir(frames_dir):
+                        if f"_f{frame_num}_" in ff:
+                            ext = os.path.splitext(ff)[1]
+                            new_name = f"{plate_safe}_{category}_f{frame_num}{ext}"
+                            src = os.path.join(frames_dir, ff)
+                            dst = os.path.join(poste_frames_dir, new_name)
+                            try:
+                                shutil.copy2(src, dst)
+                                frames_copied += 1
+                            except OSError:
+                                pass
+                            break
+            if frames_copied > 0:
+                log_progress(f"   🖼️  {frames_copied} frames entières sauvées dans frames_per_poste/{poste_name}/")
 
             # Ajouter la direction (sens) à chaque résultat
             video_direction = get_video_direction(vinfo["video_name"])
