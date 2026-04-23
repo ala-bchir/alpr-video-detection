@@ -18,3 +18,5 @@ hydra-core
 omegaconf
 psutil
 tqdm
+openai
+requests
