@@ -60,15 +60,15 @@ Output ONLY the plate text in uppercase (letters and numbers only, no spaces or 
 If a character is unreadable or unclear, replace it with an asterisk (*).
 No explanation, no formatting, just the characters on the plate."""
 
-# Regex pour parser le nom de la vidéo : 2_YYYYMMDD_HHMMSS_0025d5.avi
+# Regex pour parser le nom de la vidéo : 2_YYYYMMDD_HHMMSS_0025d5.avi (ou .mp4, ou 0025h5.mp4)
 VIDEO_NAME_PATTERN = re.compile(
-    r'^\d+_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})_[0-9a-fA-F]+\.(avi|AVI)$',
+    r'^\d+_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})_[0-9a-zA-Z]+\.(avi|mp4|mkv|mov)$',
     re.IGNORECASE
 )
 
-# Regex pour parser le H.265 : U20260310-06584419N100.265
+# Regex pour parser le format U (ex: U20260310-06584419N100.265 ou .mp4)
 VIDEO_H265_PATTERN = re.compile(
-    r'^U(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})\d*N\d+\.265$',
+    r'^U(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})\d*N\d+\.(265|mp4|avi|mkv|mov)$',
     re.IGNORECASE
 )
 
@@ -297,16 +297,21 @@ def convert_h265_to_mp4(video_path):
     result = subprocess.run(
         [
             "ffmpeg", "-y",
+            "-fflags", "+genpts",
+            "-c:v", "hevc",       # Forcer ffmpeg à l'interpréter l'entrée comme du HEVC
             "-i", video_path,
-            "-c:v", "copy",      # Remux sans réencodage (très rapide)
-            "-an",               # Pas d'audio
+            "-map", "0:v:0",      # Sélectionner uniquement la première piste vidéo (ignorer l'audio et les métadonnées inconnues)
+            "-c:v", "copy",       # Copier le flux sans réencoder
+            "-tag:v", "hvc1",     # Forcer le tag MP4 correct pour le HEVC
+            "-an",
             mp4_path
         ],
         capture_output=True, text=True
     )
 
     if result.returncode != 0:
-        print(f"   ❌ Erreur conversion ffmpeg: {result.stderr[:300]}")
+        error_msg = result.stderr[-500:] if result.stderr else "Erreur inconnue"
+        print(f"   ❌ Erreur conversion ffmpeg:\n{error_msg}")
         return None
 
     size_mb = os.path.getsize(mp4_path) / (1024 * 1024)
@@ -377,8 +382,14 @@ def run_sam3_extraction(frame_skip=1, mask_zones=None):
 
 def run_auto_sort():
     """Exécute le tri automatique des plaques."""
+    env = os.environ.copy()
+    env["CROP_DIR"] = CROP_DIR
+    env["CLEAN_DIR"] = CLEAN_DIR
+    env["REJECTED_BASE_DIR"] = os.path.join(DATA_DIR, "rejected_plates")
+
     result = subprocess.run(
         ["python3", "auto_sort_plates.py"],
+        env=env,
         cwd=BASE_DIR,
         capture_output=True, text=True
     )
@@ -411,7 +422,8 @@ def clean_plate_text(text):
 
 
 def run_glm_ocr():
-    """Exécute l'OCR avec GLM-OCR sur les plaques corrigées."""
+    """Exécute l'OCR avec GLM-OCR sur les plaques corrigées (en parallèle)."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     client = OpenAI(api_key="EMPTY", base_url=VLLM_URL)
 
     files = sorted([f for f in os.listdir(CORRECTED_DIR)
@@ -422,7 +434,8 @@ def run_glm_ocr():
         return []
 
     results = []
-    for i, filename in enumerate(files):
+    
+    def process_file(filename):
         img_path = os.path.join(CORRECTED_DIR, filename)
         try:
             base64_image = encode_image(img_path)
@@ -439,14 +452,24 @@ def run_glm_ocr():
             )
             raw_answer = response.choices[0].message.content.strip()
             plate_text = clean_plate_text(raw_answer)
-            results.append({
+            return {
                 "filename": filename,
                 "plate": plate_text,
                 "frame": extract_frame_number(filename),
                 "category": extract_vehicle_category(filename)
-            })
+            }
         except Exception as e:
             print(f"   ❌ Erreur OCR sur {filename}: {e}")
+            return None
+
+    # Parallélisation des appels OCR vers vLLM (vLLM est conçu pour le batching asynchrone)
+    print(f"   🚀 OCR parallèle sur {len(files)} crops...")
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        future_to_file = {executor.submit(process_file, f): f for f in files}
+        for future in as_completed(future_to_file):
+            res = future.result()
+            if res is not None:
+                results.append(res)
 
     print(f"   ✅ {len(results)} plaques lues par OCR")
     return results

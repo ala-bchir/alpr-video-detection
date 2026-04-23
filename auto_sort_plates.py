@@ -14,9 +14,9 @@ import numpy as np
 from pathlib import Path
 
 # ============== CONFIGURATION ==============
-CROP_DIR = "data/crop"
-CLEAN_DIR = "data/clean_plates"
-REJECTED_BASE_DIR = "data/rejected_plates"
+CROP_DIR = os.environ.get("CROP_DIR", "data/crop")
+CLEAN_DIR = os.environ.get("CLEAN_DIR", "data/clean_plates")
+REJECTED_BASE_DIR = os.environ.get("REJECTED_BASE_DIR", "data/rejected_plates")
 
 # Critères de filtrage
 MAX_RATIO = 7.0             # Ratio max (largeur/hauteur) - plaque trop allongée

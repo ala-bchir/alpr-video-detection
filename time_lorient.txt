@@ -6,7 +6,9 @@
 
 https://cloud.itecmobility.com/remote.php/dav/files/Ala , Ala , 24z4k-HjLyC-Ab9kF-mfYX2-arEbg
 
-rclone copy "/media/solayman/Elements/LAPI Lorient/LAPI_Lorient2" nextcloud:lorient -P
+
+rclone copy "/media/solayman/Elements/LAPI Lorient/LAPI_Lorient2" nextcloud:lorient/lorient2 -P
+rclone copy "/media/solayman/Elements/LAPI Lorient/LAPI_Lorient1/S3" nextcloud:lorient/lorient1/S30 -P --webdav-nextcloud-chunk-size 0
 
 
 double sens : 
@@ -32,4 +34,11 @@ double
 1:25.9
 2:14.7
 3:10.5
+
+docker build -f Dockerfile.runpod -t alpr-runpod-worker:v3 .
+docker push ghcr.io/ala-bchir/alpr-runpod-worker:v3
+docker tag alpr-runpod-worker:v3 ghcr.io/ala-bchir/alpr-runpod-worker:v3
+
+
+modal run modal_app.py --poste 
 

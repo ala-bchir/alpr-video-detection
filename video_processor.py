@@ -11,8 +11,7 @@ from tqdm import tqdm
 # ==============================================================================
 # 1. CONFIGURATION CUDA (Cohabitation avec vLLM sur RunPod)
 # ==============================================================================
-# cuDNN ne peut pas s'initialiser quand vLLM occupe une partie de la VRAM.
-# On le désactive pour forcer PyTorch à utiliser ses convolutions natives.
+# CuDNN ralentit l'architecture Transformer de SAM3 sur L40S, on utilise le backend natif ATen
 torch.backends.cudnn.enabled = False
 torch.backends.cudnn.benchmark = False
 
@@ -69,10 +68,10 @@ from sam3.model.sam3_image_processor import Sam3Processor
 # ==============================================================================
 # 4. CONSTANTES & CONFIGURATION ALPR
 # ==============================================================================
-INPUT_VIDEO_DIR = "/app/data/videos"
-OUTPUT_IMAGES_DIR = "/app/data/images"
-OUTPUT_CROP_DIR = "/app/data/crop"
-WEIGHTS_PATH = "/app/sam3_weights.pt"
+INPUT_VIDEO_DIR = os.environ.get("INPUT_VIDEO_DIR", "/app/data/videos")
+OUTPUT_IMAGES_DIR = os.environ.get("OUTPUT_IMAGES_DIR", "/app/data/images")
+OUTPUT_CROP_DIR = os.environ.get("OUTPUT_CROP_DIR", "/app/data/crop")
+WEIGHTS_PATH = os.environ.get("WEIGHTS_PATH", "/app/sam3_weights.pt")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 LABEL_MAPPING = {
@@ -201,7 +200,7 @@ def process_videos():
                 pil_img = Image.fromarray(rgb_frame)
 
                 try:
-                    with torch.inference_mode():
+                    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                         inference_state = processor.set_image(pil_img)
                         best_detection = None
 
