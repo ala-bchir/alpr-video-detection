@@ -369,7 +369,7 @@ def main():
         video_path = os.path.join(POSTE_DIR, args.video)
     else:
         videos = [f for f in os.listdir(POSTE_DIR)
-                  if f.lower().endswith(('.avi', '.mp4', '.mkv', '.mov'))]
+                  if f.lower().endswith(('.avi', '.mp4', '.mkv', '.mov', '.264', '.265', '.h264', '.h265'))]
         if not videos:
             print(f"❌ Aucune vidéo trouvée dans {POSTE_DIR}")
             sys.exit(1)

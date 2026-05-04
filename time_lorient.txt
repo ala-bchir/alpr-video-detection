@@ -8,7 +8,7 @@ https://cloud.itecmobility.com/remote.php/dav/files/Ala , Ala , 24z4k-HjLyC-Ab9k
 
 
 rclone copy "/media/solayman/Elements/LAPI Lorient/LAPI_Lorient2" nextcloud:lorient/lorient2 -P
-rclone copy "/media/solayman/Elements/LAPI Lorient/LAPI_Lorient1/S3" nextcloud:lorient/lorient1/S30 -P --webdav-nextcloud-chunk-size 0
+rclone copy "/solayman/sam3_licencePlate_processing/sam3_weights.pt" nextcloud:poids -P
 
 
 double sens : 

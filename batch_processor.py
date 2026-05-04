@@ -62,7 +62,7 @@ No explanation, no formatting, just the characters on the plate."""
 
 # Regex pour parser le nom de la vidéo : 2_YYYYMMDD_HHMMSS_0025d5.avi (ou .mp4, ou 0025h5.mp4)
 VIDEO_NAME_PATTERN = re.compile(
-    r'^\d+_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})_[0-9a-zA-Z]+\.(avi|mp4|mkv|mov)$',
+    r'^\d+_(\d{4})(\d{2})(\d{2})[_-](\d{2})(\d{2})(\d{2})_[0-9a-zA-Z]+\.(avi|mp4|mkv|mov)$',
     re.IGNORECASE
 )
 
