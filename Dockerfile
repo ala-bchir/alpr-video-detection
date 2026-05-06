@@ -22,7 +22,7 @@ RUN pip install --no-cache-dir opencv-python-headless==4.8.0.74
 # 5. Installation SAM 3
 RUN git clone https://github.com/facebookresearch/sam3.git /app/sam3_repo
 RUN pip install -e /app/sam3_repo
-RUN sed -i 's/device="cuda"/device="cpu"/g' /app/sam3_repo/sam3/model/position_encoding.py
+# La nouvelle SAM3 gère les devices correctement — pas besoin de forcer CPU
 
 # 6. Fichiers
 RUN mkdir -p /app/videos /app/data/images /app/data/crop
