@@ -1,11 +1,18 @@
 import os
 import json
+import subprocess
 import cv2
 import torch
 import numpy as np
 from PIL import Image
 from datetime import datetime
 from tqdm import tqdm
+
+torch.backends.cudnn.enabled = False
+torch.backends.cudnn.benchmark = False
+
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
 
 # SAM 3 - Imports officiels
 from sam3.model_builder import build_sam3_image_model
@@ -19,11 +26,11 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Catégories de véhicules à détecter (label CSV → prompt SAM3)
 VEHICLE_MAPPING = {
-    "VL": "car",
-    "PL": "truck",
+    # "VL": "car",
+    # "PL": "truck",
     "MOTO": "motorcycle",
     "BUS": "bus",
-    "VAN": "van",
+    # "VAN": "van",
 }
 
 # --- PARAMÈTRES DE FILTRAGE ---
@@ -47,16 +54,60 @@ def load_mask_zones():
         return []
 
 def apply_mask(frame, mask_zones):
-    """Applique les zones de masquage (noir) sur le frame."""
+    """Applique les zones de masquage (noir) sur le frame — supporte polygones et rectangles."""
     for zone in mask_zones:
-        x1 = max(0, int(zone.get('x1', 0)))
-        y1 = max(0, int(zone.get('y1', 0)))
-        x2 = min(frame.shape[1], int(zone.get('x2', 0)))
-        y2 = min(frame.shape[0], int(zone.get('y2', 0)))
-        frame[y1:y2, x1:x2] = 0
+        if 'points' in zone:
+            # Polygon format: { points: [{x, y}, ...] }
+            pts = np.array([[int(p['x']), int(p['y'])] for p in zone['points']], dtype=np.int32)
+            cv2.fillPoly(frame, [pts], (0, 0, 0))
+        else:
+            # Legacy rectangle format: {x1, y1, x2, y2}
+            x1 = max(0, int(zone.get('x1', 0)))
+            y1 = max(0, int(zone.get('y1', 0)))
+            x2 = min(frame.shape[1], int(zone.get('x2', 0)))
+            y2 = min(frame.shape[0], int(zone.get('y2', 0)))
+            frame[y1:y2, x1:x2] = 0
     return frame
 
 MASK_ZONES = load_mask_zones()
+
+
+def convert_h264_to_mp4(video_path):
+    """Convertit un fichier H.264 brut (.264/.h264) en MP4 via ffmpeg."""
+    tmp_dir = os.path.join(os.path.dirname(OUTPUT_FRAMES_DIR), "tmp_h264")
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    basename = os.path.splitext(os.path.basename(video_path))[0]
+    mp4_path = os.path.join(tmp_dir, f"{basename}.mp4")
+
+    if os.path.exists(mp4_path):
+        print(f"   ♻️  Fichier déjà converti: {os.path.basename(mp4_path)}")
+        return mp4_path
+
+    print(f"   🔄 Conversion H.264 → MP4...")
+    result = subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-fflags", "+genpts",
+            "-c:v", "h264",
+            "-i", video_path,
+            "-map", "0:v:0",
+            "-c:v", "copy",
+            "-an",
+            mp4_path
+        ],
+        capture_output=True, text=True
+    )
+
+    if result.returncode != 0:
+        error_msg = result.stderr[-500:] if result.stderr else "Erreur inconnue"
+        print(f"   ❌ Erreur conversion ffmpeg:\n{error_msg}")
+        return None
+
+    size_mb = os.path.getsize(mp4_path) / (1024 * 1024)
+    print(f"   ✅ Converti: {os.path.basename(mp4_path)} ({size_mb:.0f} MB)")
+    return mp4_path
+
 
 def setup_model():
     print(f"🏗️ Chargement de SAM 3 sur {DEVICE} (Mode Standard Float32)...")
@@ -71,7 +122,7 @@ def setup_model():
 def process_videos():
     os.makedirs(OUTPUT_FRAMES_DIR, exist_ok=True)
     
-    video_files = [f for f in os.listdir(INPUT_VIDEO_DIR) if f.endswith(('.mp4', '.avi', '.mkv', '.mov'))]
+    video_files = [f for f in os.listdir(INPUT_VIDEO_DIR) if f.endswith(('.mp4', '.avi', '.mkv', '.mov', '.264', '.h264'))]
     if not video_files:
         print("⚠️ Aucune vidéo trouvée dans /videos")
         return
@@ -80,6 +131,14 @@ def process_videos():
 
     for video_name in video_files:
         video_path = os.path.join(INPUT_VIDEO_DIR, video_name)
+
+        if video_path.lower().endswith(('.264', '.h264')):
+            converted = convert_h264_to_mp4(video_path)
+            if not converted:
+                print(f"⚠️  Impossible de convertir {video_name}, ignoré")
+                continue
+            video_path = converted
+
         cap = cv2.VideoCapture(video_path)
         
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -111,35 +170,36 @@ def process_videos():
                 pil_img = Image.fromarray(rgb_frame)
                 
                 try:
-                    inference_state = processor.set_image(pil_img)
-                    vehicle_detected = None
+                    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.float16):
+                        inference_state = processor.set_image(pil_img)
+                        vehicle_detected = None
 
-                    # Recherche des véhicules - on s'arrête dès qu'on en trouve un seul confiant (Optimisation de vitesse)
-                    for v_label, sam_prompt in VEHICLE_MAPPING.items():
-                        output = processor.set_text_prompt(state=inference_state, prompt=sam_prompt)
-                        
-                        boxes = output.get("boxes")
-                        scores = output.get("scores")
+                        # Recherche des véhicules - on s'arrête dès qu'on en trouve un seul confiant (Optimisation de vitesse)
+                        for v_label, sam_prompt in VEHICLE_MAPPING.items():
+                            output = processor.set_text_prompt(state=inference_state, prompt=sam_prompt)
 
-                        if boxes is not None and len(boxes) > 0:
-                            boxes_np = boxes.float().cpu().numpy()
-                            scores_np = scores.float().cpu().numpy()
+                            boxes = output.get("boxes")
+                            scores = output.get("scores")
 
-                            for box, score in zip(boxes_np, scores_np):
-                                score_val = float(score)
-                                if score_val < CONFIDENCE_THRESHOLD:
-                                    continue
+                            if boxes is not None and len(boxes) > 0:
+                                boxes_np = boxes.float().cpu().numpy()
+                                scores_np = scores.float().cpu().numpy()
 
-                                x1, y1, x2, y2 = box
-                                area = (x2 - x1) * (y2 - y1)
-                                ratio = area / total_area
+                                for box, score in zip(boxes_np, scores_np):
+                                    score_val = float(score)
+                                    if score_val < CONFIDENCE_THRESHOLD:
+                                        continue
 
-                                if ratio >= MIN_BOX_AREA_THRESHOLD:
-                                    vehicle_detected = {'label': v_label, 'score': score_val}
-                                    break # On a trouvé un véhicule valide dans cette catégorie
-                        
-                        if vehicle_detected:
-                            break # On arrête de tester les autres types de véhicules pour aller plus vite
+                                    x1, y1, x2, y2 = box
+                                    area = (x2 - x1) * (y2 - y1)
+                                    ratio = area / total_area
+
+                                    if ratio >= MIN_BOX_AREA_THRESHOLD:
+                                        vehicle_detected = {'label': v_label, 'score': score_val}
+                                        break
+
+                            if vehicle_detected:
+                                break
 
                     if vehicle_detected:
                         timestamp = datetime.now().strftime("%H%M%S")

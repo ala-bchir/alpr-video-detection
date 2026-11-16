@@ -16,7 +16,7 @@ GLM_OCR=zai-org/GLM-OCR
 ROLM_OCR=reducto/RolmOCR
 
 .PHONY: build run all clean sort stop-vlm start-qwen-7b start-qwen-2b-ocr label-7b label-2b-ocr \
-        build-runpod push-runpod test-runpod
+        build-runpod push-runpod test-runpod extract-vehicles
 
 # ============================================
 # RUNPOD — Worker Cloud (Étapes 3 & 4)
@@ -104,13 +104,18 @@ sort:
 # EXTRACTION DE VÉHICULES
 # ============================================
 extract-vehicles:
+	@echo "🚗 Extraction des frames véhicules (VL/PL/MOTO/BUS/VAN)..."
+	@mkdir -p $(PWD)/data/vehicle_frames
 	docker run --rm --gpus all \
 		--ipc=host \
+		--ulimit memlock=-1 \
+		--ulimit stack=67108864 \
 		-v $(PWD)/data/videos:/app/data/videos \
 		-v $(PWD)/data/vehicle_frames:/app/data/vehicle_frames \
 		-v $(PWD)/sam3_weights.pt:/app/sam3_weights.pt \
 		-v $(PWD)/extract_vehicles.py:/app/extract_vehicles.py \
 		$(IMAGE_NAME) python3 /app/extract_vehicles.py
+	@echo "✅ Résultats dans data/vehicle_frames/"
 
 # ============================================
 # QWEN VL - Vision Language Models pour OCR

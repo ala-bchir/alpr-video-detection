@@ -72,6 +72,12 @@ VIDEO_H265_PATTERN = re.compile(
     re.IGNORECASE
 )
 
+# Regex pour parser le format Dahua (ex: Dahua_ANPR_01_ch1_20261112084409_20261112094409.avi)
+VIDEO_DAHUA_PATTERN = re.compile(
+    r'^[A-Za-z0-9]+_[A-Za-z0-9]+_\d+_ch\d+_(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})_\d{14}\.(avi|mp4|mkv|mov|265)$',
+    re.IGNORECASE
+)
+
 
 # ============== UTILITAIRES ==============
 
@@ -89,6 +95,9 @@ def parse_video_name(filename):
         # Essayer le format H.265
         match = VIDEO_H265_PATTERN.match(filename)
     if not match:
+        # Essayer le format Dahua (Dahua_ANPR_01_ch1_YYYYMMDDHHMMSS_YYYYMMDDHHMMSS.avi)
+        match = VIDEO_DAHUA_PATTERN.match(filename)
+    if not match:
         return None, None
 
     year, month, day = match.group(1), match.group(2), match.group(3)
@@ -102,32 +111,87 @@ def parse_video_name(filename):
     return date_str, start_dt
 
 
+def _dahua_camera_id(filename):
+    """
+    Extrait l'identifiant caméra d'un fichier Dahua pour en faire un nom de poste.
+    Dahua_ANPR_01_ch1_... → 'Dahua_ANPR_01'
+    Retourne None si le fichier ne correspond pas au format Dahua.
+    """
+    m = VIDEO_DAHUA_PATTERN.match(filename)
+    if not m:
+        return None
+    # Prendre les trois premiers segments : Marque_Type_Num
+    parts = filename.split('_')
+    if len(parts) >= 3:
+        return '_'.join(parts[:3])
+    return 'Dahua'
+
+
 def discover_postes(base_dir, filter_postes=None):
     """
     Découvre les dossiers de postes dans le répertoire de base.
+    Gère aussi les vidéos déposées directement dans base_dir (sans sous-dossier) :
+    elles sont regroupées sous un poste virtuel dont le nom est dérivé du nom de fichier
+    (ex: Dahua_ANPR_01) ou 'DEFAULT' si le nom ne peut être parsé.
     Retourne une liste triée de (nom_poste, chemin_absolu).
     """
     postes = []
+    loose_videos_by_poste = {}  # nom_poste → base_dir (les vidéos restent sur place)
+
     for entry in sorted(os.listdir(base_dir)):
         full_path = os.path.join(base_dir, entry)
         if os.path.isdir(full_path):
             if filter_postes and entry not in filter_postes:
                 continue
             postes.append((entry, full_path))
+        elif entry.lower().endswith(('.avi', '.mp4', '.mkv', '.mov', '.265')):
+            # Vidéo déposée directement dans base_dir : dériver le nom de poste
+            poste_name = _dahua_camera_id(entry) or 'DEFAULT'
+            if filter_postes and poste_name not in filter_postes:
+                continue
+            if poste_name not in loose_videos_by_poste:
+                loose_videos_by_poste[poste_name] = base_dir
+
+    # Ajouter les postes virtuels (vidéos en vrac) s'ils n'ont pas déjà un dossier dédié
+    existing_names = {p[0] for p in postes}
+    for poste_name, poste_dir in sorted(loose_videos_by_poste.items()):
+        if poste_name not in existing_names:
+            postes.append((poste_name, poste_dir))
+            print(f"   ℹ️  Poste virtuel '{poste_name}' : vidéos trouvées directement dans {poste_dir}")
+
     return postes
 
 
-def discover_videos(poste_dir):
+def discover_videos(poste_dir, poste_name=None):
     """
     Découvre toutes les vidéos dans un dossier de poste.
     Recherche récursive dans les sous-dossiers (ex: 20260228_07/).
     Formats supportés: .avi, .mp4, .mkv, .mov, .265
+
+    Quand poste_dir est le répertoire de base des vidéos (poste virtuel),
+    seules les vidéos dont le nom correspond au poste_name sont retournées,
+    afin de ne pas mélanger des caméras différentes.
+
     Retourne une liste triée de chemins absolus vers les fichiers vidéo.
     """
     videos = []
+    is_virtual = poste_name and poste_name != os.path.basename(poste_dir)
+
     for root, dirs, files in os.walk(poste_dir):
+        # Pour un poste virtuel (vidéos en vrac dans le répertoire de base),
+        # on ne descend pas dans les sous-dossiers : ils appartiennent à d'autres postes.
+        if is_virtual and root != poste_dir:
+            dirs.clear()
+            continue
+
         for f in files:
             if f.lower().endswith(('.avi', '.mp4', '.mkv', '.mov', '.265')):
+                if is_virtual:
+                    cam_id = _dahua_camera_id(f)
+                    if cam_id and cam_id != poste_name:
+                        continue
+                    if not cam_id and poste_name != 'DEFAULT':
+                        continue
                 videos.append(os.path.join(root, f))
     return sorted(videos)
 
@@ -154,12 +218,20 @@ def is_dual_direction(videos):
     return has_1 and has_2
 
 
-def load_mask_config(poste_dir):
+def load_mask_config(poste_dir, poste_name=None):
     """
     Charge le fichier mask.json d'un poste.
+    Pour un poste normal : cherche poste_dir/mask.json
+    Pour un poste virtuel (poste_dir == répertoire de base des vidéos) :
+      cherche poste_dir/mask_{poste_name}.json pour éviter les collisions.
     Retourne la liste des zones de masquage ou [] si pas de fichier.
     """
-    mask_file = os.path.join(poste_dir, "mask.json")
+    is_virtual = poste_name and poste_name != os.path.basename(poste_dir)
+    if is_virtual:
+        mask_file = os.path.join(poste_dir, f"mask_{poste_name}.json")
+    else:
+        mask_file = os.path.join(poste_dir, "mask.json")
+
     if not os.path.exists(mask_file):
         return []
     try:
@@ -209,15 +281,24 @@ def extract_vehicle_category(filename):
 # ============== GLM-OCR SERVER ==============
 
 def check_glm_server():
-    """Vérifie si le serveur GLM-OCR est actif."""
+    """Vérifie si le container ou le serveur GLM-OCR est actif.
+
+    Vérifie d'abord le container Docker (même si l'API HTTP est tombée),
+    puis l'API HTTP en fallback.
+    """
+    # Vérification Docker (plus fiable pour la détection VRAM)
+    result = subprocess.run(
+        ["docker", "inspect", "--format={{.State.Running}}", "qwen-labeler"],
+        capture_output=True, text=True
+    )
+    if result.stdout.strip() == "true":
+        return True
+    # Fallback : vérifier l'API HTTP (cas où le container a un autre nom)
     try:
         import requests
         response = requests.get(f"{VLLM_URL}/models", timeout=5)
         if response.status_code == 200:
-            models = response.json().get("data", [])
-            for model in models:
-                if "GLM-OCR" in model.get("id", ""):
-                    return True
+            return True
     except Exception:
         pass
     return False
@@ -226,11 +307,9 @@ def check_glm_server():
 def stop_glm_server():
     """Arrête le serveur GLM-OCR pour libérer la VRAM."""
     print("🛑 Arrêt de GLM-OCR pour libérer la VRAM...")
-    subprocess.run(
-        ["make", "stop-vlm"],
-        cwd=BASE_DIR,
-        capture_output=True, text=True
-    )
+    # Arrêt direct du container (ne dépend pas de l'API HTTP)
+    subprocess.run(["docker", "stop", "qwen-labeler"], capture_output=True, text=True)
+    subprocess.run(["docker", "rm", "-f", "qwen-labeler"], capture_output=True, text=True)
     time.sleep(3)
 
 
@@ -253,7 +332,7 @@ def start_glm_server():
     return True
 
 
-def wait_for_glm_server(timeout=180):
+def wait_for_glm_server(timeout=360):
     """Attend que le serveur GLM-OCR soit prêt."""
     start_time = time.time()
     while time.time() - start_time < timeout:
@@ -494,9 +573,13 @@ def apply_filters(ocr_results):
     """
     initial_count = len(ocr_results)
 
-    # Filtre longueur
+    # Filtre longueur sur la forme normalisée (sans espaces/tirets) pour ne pas
+    # rejeter les plaques FNI dont le format formaté "1234 AB 75" a 10 chars
+    def _plate_norm_len(plate):
+        return len(re.sub(r'[\s\-]', '', plate))
+
     filtered = [r for r in ocr_results
-                if MIN_PLATE_LENGTH <= len(r["plate"]) <= MAX_PLATE_LENGTH]
+                if MIN_PLATE_LENGTH <= _plate_norm_len(r["plate"]) <= MAX_PLATE_LENGTH]
     rejected_length = initial_count - len(filtered)
 
     # Filtre alphanumérique : doit contenir lettres ET chiffres
@@ -504,10 +587,11 @@ def apply_filters(ocr_results):
     filtered = [r for r in filtered if _has_letters_and_digits(r["plate"])]
     rejected_alpha = before_alpha - len(filtered)
 
-    # Padding
+    # Padding uniquement pour les plaques SIV incomplètes (pas les FNI)
     for r in filtered:
-        if len(r["plate"]) < STANDARD_PLATE_LENGTH:
-            missing = STANDARD_PLATE_LENGTH - len(r["plate"])
+        norm_len = _plate_norm_len(r["plate"])
+        if norm_len < STANDARD_PLATE_LENGTH and r.get("format") != "FNI":
+            missing = STANDARD_PLATE_LENGTH - norm_len
             r["plate"] = r["plate"] + "*" * missing
 
     print(f"   📋 Filtres: {len(filtered)}/{initial_count} conservées "
@@ -535,10 +619,9 @@ def apply_deduplication(results, fps, time_window=3):
     """Déduplication intelligente."""
     from dedup_plates import deduplicate
 
-    dedup1 = deduplicate(results, fps, time_window=time_window)
-    dedup2 = deduplicate(dedup1, fps, time_window=time_window)
-    print(f"   📋 Dédup: {len(results)} → {len(dedup2)} plaques uniques")
-    return dedup2
+    deduped = deduplicate(results, fps, time_window=time_window)
+    print(f"   📋 Dédup: {len(results)} → {len(deduped)} plaques uniques")
+    return deduped
 
 
 def calculate_timestamps(results, start_datetime, fps):
@@ -590,17 +673,40 @@ def _normalize_plate(plate_text):
     return re.sub(r'[\s\-*]', '', plate_text.upper())
 
 
-def remove_exact_duplicates(results):
-    """Supprime les doublons exacts (même texte de plaque, normalisé sans tirets/espaces)."""
-    seen = set()
-    unique = []
-    for r in results:
-        normalized = _normalize_plate(r["plate"])
-        if normalized not in seen:
-            seen.add(normalized)
-            unique.append(r)
+def remove_cross_video_duplicates(results, time_window_s=10):
+    """
+    Supprime les doublons inter-vidéos dans une fenêtre temporelle.
+
+    time_window_s=None : fenêtre infinie — une seule occurrence par plaque
+                         sur l'ensemble du poste (dédup globale).
+    time_window_s=N    : filtre les doublons vus dans les N dernières secondes.
+    """
+    from datetime import datetime as _dt
+    if time_window_s is None:
+        # Dédup globale : garder uniquement la première occurrence de chaque plaque
+        seen: set[str] = set()
+        unique = []
+        for r in results:
+            normalized = _normalize_plate(r["plate"])
+            if normalized not in seen:
+                seen.add(normalized)
+                unique.append(r)
+    else:
+        seen_ts: dict[str, object] = {}  # plate_norm → dernier datetime
+        unique = []
+        for r in results:
+            normalized = _normalize_plate(r["plate"])
+            try:
+                ts = _dt.strptime(f"{r['date']} {r['timestamp']}", "%Y-%m-%d %H:%M:%S")
+            except (KeyError, ValueError):
+                unique.append(r)
+                continue
+            last = seen_ts.get(normalized)
+            if last is None or (ts - last).total_seconds() > time_window_s:
+                seen_ts[normalized] = ts
+                unique.append(r)
     if len(results) != len(unique):
-        print(f"   🔁 Doublons exacts: {len(results)} → {len(unique)}")
+        print(f"   🔁 Doublons inter-vidéos: {len(results)} → {len(unique)}")
     return unique
 
 
@@ -661,14 +767,16 @@ def process_single_video(video_path, frame_skip=1, time_window=3, glm_ready=Fals
         print(f"   ⚠️  OCR n'a retourné aucun résultat")
         return []
 
-    # Étape 5: Filtre longueur
-    filtered = apply_filters(ocr_results)
+    # Étape 5: Correction regex (avant filtre — la correction peut valider une plaque rejetée)
+    corrected_raw = apply_regex_correction(ocr_results)
+
+    # Étape 6: Filtre longueur + alphanumérique
+    filtered = apply_filters(corrected_raw)
     if not filtered:
         print(f"   ⚠️  Aucune plaque valide après filtrage")
         return []
 
-    # Étape 6: Correction regex
-    corrected = apply_regex_correction(filtered)
+    corrected = filtered  # déjà corrigé
 
     # Étape 7: Déduplication
     deduped = apply_deduplication(corrected, fps, time_window)
@@ -677,10 +785,7 @@ def process_single_video(video_path, frame_skip=1, time_window=3, glm_ready=Fals
     timestamped = calculate_timestamps(deduped, start_dt, fps)
 
     # Étape 9: Filtre même seconde
-    cleaned = apply_same_second_filter(timestamped)
-
-    # Étape 10: Doublons exacts
-    unique = remove_exact_duplicates(cleaned)
+    unique = apply_same_second_filter(timestamped)
 
     print(f"   ✅ {len(unique)} plaques détectées dans cette vidéo")
     return unique
@@ -802,8 +907,8 @@ def main():
     parser.add_argument(
         "--time-window", "-w",
         type=int,
-        default=3,
-        help="Fenêtre temporelle de déduplication en secondes (défaut: 3)"
+        default=5,
+        help="Fenêtre temporelle de déduplication en secondes (défaut: 5)"
     )
     parser.add_argument(
         "--dry-run",
@@ -838,7 +943,7 @@ def main():
     poste_dual = {}  # True si le poste est à double sens
     total_videos = 0
     for poste_name, poste_dir in postes:
-        videos = discover_videos(poste_dir)
+        videos = discover_videos(poste_dir, poste_name)
         # Filtrer uniquement les vidéos dont le nom est parsable
         valid_videos = []
         for v in videos:
@@ -930,7 +1035,7 @@ def main():
         log_progress("=" * 70)
 
         # Charger le mask pour ce poste
-        mask_zones = load_mask_config(poste_dir)
+        mask_zones = load_mask_config(poste_dir, poste_name)
 
         # Préparer le dossier de crops par vidéo
         poste_crops_dir = os.path.join(CROPS_BASE_DIR, poste_name)
@@ -1082,20 +1187,19 @@ def main():
         phase2_start = time.time()
         poste_results = []
 
+        # Client unique pour tout le poste (évite de recréer une session HTTP par vidéo)
+        ocr_client = OpenAI(api_key="EMPTY", base_url=VLLM_URL)
+
         for vid_idx, vinfo in enumerate(videos_with_crops):
             log_progress(f"\n   {'─' * 40}")
             log_progress(f"   📋 OCR {vid_idx + 1}/{len(videos_with_crops)}: {vinfo['video_name']} ({vinfo['crop_count']} crops)")
 
-            # Lire les crops de cette vidéo pour l'OCR
-            client = OpenAI(api_key="EMPTY", base_url=VLLM_URL)
             files = sorted([f for f in os.listdir(vinfo["crops_dir"])
                            if f.lower().endswith(('.jpg', '.png', '.jpeg'))])
 
-            ocr_results = []
-            for filename in files:
-                img_path = os.path.join(vinfo["crops_dir"], filename)
+            def _ocr_one(filename, crops_dir=vinfo["crops_dir"], client=ocr_client):
                 try:
-                    base64_image = encode_image(img_path)
+                    base64_image = encode_image(os.path.join(crops_dir, filename))
                     response = client.chat.completions.create(
                         model=GLM_MODEL,
                         messages=[{
@@ -1109,14 +1213,23 @@ def main():
                     )
                     raw_answer = response.choices[0].message.content.strip()
                     plate_text = clean_plate_text(raw_answer)
-                    ocr_results.append({
+                    return {
                         "filename": filename,
                         "plate": plate_text,
                         "frame": extract_frame_number(filename),
                         "category": extract_vehicle_category(filename)
-                    })
-                except Exception as e:
-                    pass  # Silencieux pour la vitesse
+                    }
+                except Exception:
+                    return None
+
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            ocr_results = []
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                futures = {executor.submit(_ocr_one, f): f for f in files}
+                for future in as_completed(futures):
+                    result = future.result()
+                    if result is not None:
+                        ocr_results.append(result)
 
             if not ocr_results:
                 log_progress(f"   ⚠️  OCR sans résultat")
@@ -1124,16 +1237,15 @@ def main():
 
             log_progress(f"   ✅ {len(ocr_results)} plaques lues")
 
-            # Filtres
-            filtered = apply_filters(ocr_results)
+            # Correction regex d'abord — peut valider des plaques qu'un filtre brut rejetterait
+            corrected = apply_regex_correction(ocr_results)
+            filtered = apply_filters(corrected)
             if not filtered:
                 continue
 
-            corrected = apply_regex_correction(filtered)
-            deduped = apply_deduplication(corrected, vinfo["fps"], args.time_window)
+            deduped = apply_deduplication(filtered, vinfo["fps"], args.time_window)
             timestamped = calculate_timestamps(deduped, vinfo["start_dt"], vinfo["fps"])
-            cleaned = apply_same_second_filter(timestamped)
-            unique = remove_exact_duplicates(cleaned)
+            unique = apply_same_second_filter(timestamped)
 
             # Renommer les crops avec le texte de la plaque
             renamed_count = 0
@@ -1198,6 +1310,12 @@ def main():
 
         phase2_dur = time.time() - phase2_start
         log_progress(f"\n📊 Phase 2 terminée: {len(poste_results)} plaques ({fmt_duration(phase2_dur)})")
+
+        # ── Déduplication globale du poste (toutes vidéos confondues) ──
+        before_global = len(poste_results)
+        poste_results = remove_cross_video_duplicates(poste_results, time_window_s=None)
+        if len(poste_results) != before_global:
+            log_progress(f"   🔁 Dédup globale: {before_global} → {len(poste_results)} plaques uniques")
 
         # ── Export CSV pour ce poste ──
         poste_dur = time.time() - poste_start

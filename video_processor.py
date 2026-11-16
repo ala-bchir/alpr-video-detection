@@ -55,9 +55,15 @@ MASK_ZONES = load_mask_zones()
 
 def apply_mask(frame, mask_zones):
     for zone in mask_zones:
-        x1, y1 = max(0, int(zone.get('x1', 0))), max(0, int(zone.get('y1', 0)))
-        x2, y2 = min(frame.shape[1], int(zone.get('x2', 0))), min(frame.shape[0], int(zone.get('y2', 0)))
-        frame[y1:y2, x1:x2] = 0
+        if 'points' in zone:
+            # Polygon format: { points: [{x, y}, ...] }
+            pts = np.array([[int(p['x']), int(p['y'])] for p in zone['points']], dtype=np.int32)
+            cv2.fillPoly(frame, [pts], (0, 0, 0))
+        else:
+            # Legacy rectangle format: {x1, y1, x2, y2}
+            x1, y1 = max(0, int(zone.get('x1', 0))), max(0, int(zone.get('y1', 0)))
+            x2, y2 = min(frame.shape[1], int(zone.get('x2', 0))), min(frame.shape[0], int(zone.get('y2', 0)))
+            frame[y1:y2, x1:x2] = 0
     return frame
 
 def setup_model():
@@ -98,7 +104,7 @@ def process_videos():
         saved_count = 0
 
         print(f"\n🎬 Analyse : {video_name}")
-        pbar = tqdm(total=total_frames, desc="Progression")
+        pbar = tqdm(total=total_frames, desc="Progression", unit="frame")
 
         while True: # Utilisation de while True pour contrôle total
             ret, frame = cap.read()

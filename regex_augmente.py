@@ -50,7 +50,7 @@ FNI_REGEX = re.compile(
 # Lettres lues dans une zone de chiffres → correction en chiffre
 OCR_LETTER_TO_DIGIT: dict[str, str] = {
     'O': '0', 'Q': '0', 'D': '0',
-    'I': '1', '|': '1',
+    'I': '1', 'L': '1', '|': '1',
     'Z': '2',
     'S': '5',
     'B': '8',
@@ -64,7 +64,7 @@ OCR_DIGIT_TO_LETTER: dict[str, str] = {
     '0': 'Q',
     '1': 'L',
     '2': 'Z',
-    '3': 'B',
+    '3': 'E',   # 3 et E sont images miroir en OCR
     '4': 'A',
     '5': 'S',
     '6': 'G',
@@ -118,7 +118,7 @@ def _compute_confidence(corrections: int, total_chars: int) -> float:
     """Calcule un score de confiance proportionnel au ratio de caractères corrigés."""
     if total_chars == 0:
         return 0.0
-    return max(0.2, 1.0 - (corrections / total_chars))
+    return max(0.0, 1.0 - (corrections / total_chars))
 
 
 def _correct_zone(
@@ -198,71 +198,66 @@ def _try_fni(text: str) -> PlateResult | None:
     """Tente de matcher au format FNI : 1234 AB 57."""
     text_clean = re.sub(r'[\s\-]', '', text)
 
-    # Le FNI a entre 4 et 9 caractères (ex: "1A01" à "9999ABC99")
-    if len(text_clean) < 4 or len(text_clean) > 9:
+    # Le FNI a entre 5 et 9 caractères normalisés (ex: "1A01" trop court)
+    if len(text_clean) < 5 or len(text_clean) > 9:
         return None
 
-    best_match: tuple[str, int] | None = None
+    # Département = 2 derniers caractères (toujours en fin de plaque FNI)
+    dept = text_clean[-2:]
+    remaining = text_clean[:-2]
 
-    # Stratégie : les 2 derniers caractères sont le département (chiffres)
-    # Avant ça, il y a 1-3 lettres, et avant ça 1-4 chiffres
-    for dept_start in range(len(text_clean) - 2, 1, -1):
-        dept = text_clean[dept_start:]
-        if len(dept) != 2:
-            continue
-        remaining = text_clean[:dept_start]
+    # Trouver la séparation chiffres/lettres dans remaining (chercher depuis la droite)
+    letter_start = -1
+    for j in range(len(remaining) - 1, -1, -1):
+        if remaining[j].isdigit():
+            letter_start = j + 1
+            break
 
-        # Trouver la séparation lettres/chiffres dans remaining
-        letter_start = -1
-        for j in range(len(remaining) - 1, -1, -1):
-            if remaining[j].isdigit():
-                letter_start = j + 1
-                break
+    if letter_start < 1:  # au moins 1 chiffre avant les lettres
+        return None
 
-        if letter_start < 1:  # au moins 1 chiffre avant
-            continue
+    num_part = remaining[:letter_start]
+    letter_part = remaining[letter_start:]
 
-        num_part = remaining[:letter_start]
-        letter_part = remaining[letter_start:]
+    if not (1 <= len(num_part) <= 4):
+        return None
+    if not (1 <= len(letter_part) <= 3):
+        return None
 
-        if not (1 <= len(num_part) <= 4):
-            continue
-        if not (1 <= len(letter_part) <= 3):
-            continue
+    # Corriger chaque zone
+    num_chars = list(num_part)
+    letter_chars = list(letter_part)
+    dept_chars = list(dept)
 
-        # Corriger chaque zone avec _correct_zone
-        num_chars = list(num_part)
-        letter_chars = list(letter_part)
-        dept_chars = list(dept)
+    corr_num = _correct_zone(num_chars, OCR_LETTER_TO_DIGIT, expect_digits=True)
+    if corr_num is None:
+        return None
 
-        corr_num = _correct_zone(num_chars, OCR_LETTER_TO_DIGIT, expect_digits=True)
-        if corr_num is None:
-            continue
+    corr_let = _correct_zone(letter_chars, OCR_DIGIT_TO_LETTER, expect_digits=False)
+    if corr_let is None:
+        return None
 
-        corr_let = _correct_zone(letter_chars, OCR_DIGIT_TO_LETTER, expect_digits=False)
-        if corr_let is None:
-            continue
+    corr_dept = _correct_zone(dept_chars, OCR_LETTER_TO_DIGIT, expect_digits=True)
+    if corr_dept is None:
+        return None
 
-        corr_dept = _correct_zone(dept_chars, OCR_LETTER_TO_DIGIT, expect_digits=True)
-        if corr_dept is None:
-            continue
+    candidate = f"{''.join(num_chars)} {''.join(letter_chars)} {''.join(dept_chars)}"
 
-        total_corr = corr_num + corr_let + corr_dept
-        candidate = f"{''.join(num_chars)} {''.join(letter_chars)} {''.join(dept_chars)}"
+    if not FNI_REGEX.match(candidate):
+        return None
 
-        if FNI_REGEX.match(candidate):
-            if best_match is None or total_corr < best_match[1]:
-                best_match = (candidate, total_corr)
+    # Valider le numéro de département (01–99 ; 99 = plaques export européennes)
+    dept_num = int(''.join(dept_chars))
+    if not (1 <= dept_num <= 99):
+        return None
 
-    if best_match:
-        plate, corrections = best_match
-        total_chars = len(plate.replace(' ', ''))
-        return PlateResult(
-            raw_text=text, plate=plate, format="FNI",
-            confidence=_compute_confidence(corrections, total_chars),
-            corrections=corrections,
-        )
-    return None
+    total_corr = corr_num + corr_let + corr_dept
+    total_chars = len(text_clean)
+    return PlateResult(
+        raw_text=text, plate=candidate, format="FNI",
+        confidence=_compute_confidence(total_corr, total_chars),
+        corrections=total_corr,
+    )
 
 
 
@@ -274,14 +269,12 @@ def recognize_plate(raw_text: str) -> PlateResult:
     """
     Reconnaît et corrige une plaque d'immatriculation.
 
-    Essaie TOUS les formats et retourne le meilleur match (confiance la plus élevée).
-    En cas d'égalité, l'ordre de priorité est : SIV > FNI > UK > CH.
+    Essaie tous les formats et retourne le meilleur match (confiance la plus élevée).
+    En cas d'égalité, l'ordre de priorité est : SIV > FNI.
 
     Formats supportés :
       1. SIV  (France, AA-123-AA)
       2. FNI  (France, 1234 AB 57)
-      3. UK   (AA12 AAA)
-      4. CH   (AA 123456)
 
     Args:
         raw_text: texte brut lu par l'OCR
@@ -327,24 +320,12 @@ if __name__ == "__main__":
         ("1234AB75",     "FNI"),
         ("567 XY 13",    "FNI"),
         ("12ABC99",      "FNI"),
-        ("1 A 75",       "FNI"),     # cas court
-
-        # --- UK ---
-        ("AB12 CDE",     "UK"),
-        ("AB12CDE",      "UK"),
-        ("LB51 ABC",     "UK"),
-
-        # --- Suisse ---
-        ("ZH 123456",    "CH"),
-        ("BE 1",         "CH"),
-        ("GE12345",      "CH"),
-        ("VD 999999",    "CH"),
+        ("1 A 75",       "UNKNOWN"),  # 4 chars normalisés → trop court, rejeté
 
         # --- Invalides / cas limites ---
         ("ABCDEFGH",     "UNKNOWN"),
         ("12345678",     "UNKNOWN"),
         ("X",            "UNKNOWN"),
-        ("XX 123",       "UNKNOWN"),  # canton invalide
         ("",             "UNKNOWN"),  # chaîne vide
         ("###",          "UNKNOWN"),  # tout nettoyé → vide
         ("AB-@!#-CD",    "UNKNOWN"),  # caractères spéciaux → trop court

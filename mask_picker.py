@@ -3,7 +3,7 @@
 Mask Picker Web — Outil web pour définir les zones à masquer par poste.
 
 Ouvre un serveur web local et affiche la première frame d'une vidéo du poste.
-Permet de dessiner des rectangles à masquer directement dans le navigateur.
+Permet de dessiner des polygones à masquer directement dans le navigateur.
 Sauvegarde le résultat dans mask.json dans le dossier du poste.
 
 Usage:
@@ -79,6 +79,8 @@ HTML_PAGE = """<!DOCTYPE html>
   .btn-save:hover {{ background: #16a34a; transform: scale(1.03); }}
   .btn-undo {{ background: #f59e0b; color: #000; }}
   .btn-undo:hover {{ background: #d97706; }}
+  .btn-cancel {{ background: #8b5cf6; color: #fff; }}
+  .btn-cancel:hover {{ background: #7c3aed; }}
   .btn-reset {{ background: #ef4444; color: #fff; }}
   .btn-reset:hover {{ background: #dc2626; }}
   .badge {{
@@ -123,6 +125,7 @@ HTML_PAGE = """<!DOCTYPE html>
   <h1>🎭 Mask Picker — <span>{poste_name}</span></h1>
   <div class="controls">
     <span class="badge" id="zoneCount">0 zone(s)</span>
+    <button class="btn btn-cancel" id="btnCancel" onclick="cancelPoly()" style="display:none;">✖ Annuler poly</button>
     <button class="btn btn-undo" onclick="undoZone()">↩ Annuler</button>
     <button class="btn btn-reset" onclick="resetZones()">🔄 Reset</button>
     <button class="btn btn-save" onclick="saveZones()">💾 Sauvegarder</button>
@@ -130,20 +133,23 @@ HTML_PAGE = """<!DOCTYPE html>
 </div>
 
 <div class="help">
-  Cliquez et glissez pour dessiner des rectangles rouges sur les zones à masquer (objets fixes, plastiques, etc.)
+  🖱️ <b>Clic gauche</b> = ajouter un sommet &nbsp;|&nbsp;
+  <b>Double-clic</b> ou clic proche du 1er point = fermer le polygone &nbsp;|&nbsp;
+  <b>Échap</b> = annuler le polygone en cours
 </div>
 
 <div class="canvas-container">
   <canvas id="canvas"></canvas>
 </div>
 
-<div class="status" id="status">Prêt — dessinez des zones à masquer</div>
+<div class="status" id="status">Prêt — cliquez pour dessiner des polygones sur les zones à masquer</div>
 
 <script>
 const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
 const statusEl = document.getElementById('status');
 const zoneCountEl = document.getElementById('zoneCount');
+const btnCancel = document.getElementById('btnCancel');
 
 const img = new Image();
 const frameW = {frame_w};
@@ -154,7 +160,7 @@ const maxW = window.innerWidth - 40;
 const maxH = window.innerHeight - 160;
 const scaleX = maxW / frameW;
 const scaleY = maxH / frameH;
-const scale = Math.min(scaleX, scaleY, 1); // Never upscale
+const scale = Math.min(scaleX, scaleY, 1);
 
 const displayW = Math.floor(frameW * scale);
 const displayH = Math.floor(frameH * scale);
@@ -162,81 +168,210 @@ const displayH = Math.floor(frameH * scale);
 canvas.width = displayW;
 canvas.height = displayH;
 
-let zones = {existing_zones};
-let drawing = false;
-let startX, startY, curX, curY;
+// zones = array of polygons. Each polygon = {{ points: [{{x, y}}, ...] }}
+// Auto-convert old rect format (x1,y1,x2,y2) to polygon format on load
+let zonesRaw = {existing_zones};
+let zones = zonesRaw.map(z => {{
+  if (z.points) return z;
+  // Convert rectangle to polygon
+  return {{ points: [
+    {{x: z.x1, y: z.y1}},
+    {{x: z.x2, y: z.y1}},
+    {{x: z.x2, y: z.y2}},
+    {{x: z.x1, y: z.y2}}
+  ]}};
+}});
+
+let currentPoly = [];   // points being drawn (canvas coords)
+let mousePos = null;     // current mouse position for live preview
+const CLOSE_DIST = 12;   // px distance to snap-close to first point
 
 img.onload = () => {{ redraw(); }};
 img.src = 'data:image/jpeg;base64,{frame_b64}';
 
 function toReal(cx, cy) {{
-  return [Math.round(cx / scale), Math.round(cy / scale)];
+  return {{ x: Math.round(cx / scale), y: Math.round(cy / scale) }};
 }}
 
 function toCanvas(rx, ry) {{
   return [rx * scale, ry * scale];
 }}
 
+function dist(ax, ay, bx, by) {{
+  return Math.sqrt((ax - bx) ** 2 + (ay - by) ** 2);
+}}
+
 function redraw() {{
   ctx.drawImage(img, 0, 0, displayW, displayH);
 
-  // Draw saved zones
+  // Draw saved polygons
   for (const z of zones) {{
-    const [cx1, cy1] = toCanvas(z.x1, z.y1);
-    const [cx2, cy2] = toCanvas(z.x2, z.y2);
-    ctx.fillStyle = 'rgba(255, 0, 0, 0.35)';
-    ctx.fillRect(cx1, cy1, cx2 - cx1, cy2 - cy1);
+    ctx.beginPath();
+    const pts = z.points;
+    for (let i = 0; i < pts.length; i++) {{
+      const [cx, cy] = toCanvas(pts[i].x, pts[i].y);
+      if (i === 0) ctx.moveTo(cx, cy);
+      else ctx.lineTo(cx, cy);
+    }}
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(255, 0, 0, 0.30)';
+    ctx.fill();
     ctx.strokeStyle = '#ff0000';
     ctx.lineWidth = 2;
-    ctx.strokeRect(cx1, cy1, cx2 - cx1, cy2 - cy1);
+    ctx.stroke();
+
+    // Draw vertices
+    for (const pt of pts) {{
+      const [cx, cy] = toCanvas(pt.x, pt.y);
+      ctx.beginPath();
+      ctx.arc(cx, cy, 3, 0, Math.PI * 2);
+      ctx.fillStyle = '#ff4444';
+      ctx.fill();
+    }}
   }}
 
-  // Draw current rectangle
-  if (drawing) {{
+  // Draw current polygon being built
+  if (currentPoly.length > 0) {{
+    ctx.beginPath();
+    ctx.moveTo(currentPoly[0].cx, currentPoly[0].cy);
+    for (let i = 1; i < currentPoly.length; i++) {{
+      ctx.lineTo(currentPoly[i].cx, currentPoly[i].cy);
+    }}
+    // Line to mouse cursor
+    if (mousePos) {{
+      ctx.lineTo(mousePos.cx, mousePos.cy);
+    }}
     ctx.strokeStyle = '#00ff00';
     ctx.lineWidth = 2;
-    ctx.setLineDash([5, 5]);
-    ctx.strokeRect(startX, startY, curX - startX, curY - startY);
+    ctx.setLineDash([6, 4]);
+    ctx.stroke();
     ctx.setLineDash([]);
+
+    // Fill preview
+    if (currentPoly.length >= 3) {{
+      ctx.beginPath();
+      ctx.moveTo(currentPoly[0].cx, currentPoly[0].cy);
+      for (let i = 1; i < currentPoly.length; i++) {{
+        ctx.lineTo(currentPoly[i].cx, currentPoly[i].cy);
+      }}
+      if (mousePos) ctx.lineTo(mousePos.cx, mousePos.cy);
+      ctx.closePath();
+      ctx.fillStyle = 'rgba(0, 255, 0, 0.12)';
+      ctx.fill();
+    }}
+
+    // Draw vertices
+    for (let i = 0; i < currentPoly.length; i++) {{
+      ctx.beginPath();
+      ctx.arc(currentPoly[i].cx, currentPoly[i].cy, i === 0 ? 6 : 4, 0, Math.PI * 2);
+      ctx.fillStyle = i === 0 ? '#00ffaa' : '#00ff00';
+      ctx.fill();
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }}
+
+    // Highlight first point if mouse is close (snap zone)
+    if (mousePos && currentPoly.length >= 3) {{
+      const d = dist(mousePos.cx, mousePos.cy, currentPoly[0].cx, currentPoly[0].cy);
+      if (d < CLOSE_DIST) {{
+        ctx.beginPath();
+        ctx.arc(currentPoly[0].cx, currentPoly[0].cy, 10, 0, Math.PI * 2);
+        ctx.strokeStyle = '#00ffaa';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }}
+    }}
   }}
 
   zoneCountEl.textContent = zones.length + ' zone(s)';
+  btnCancel.style.display = currentPoly.length > 0 ? 'inline-block' : 'none';
 }}
 
-canvas.addEventListener('mousedown', (e) => {{
+function closePoly() {{
+  if (currentPoly.length < 3) {{
+    statusEl.textContent = 'Il faut au moins 3 points pour fermer un polygone';
+    statusEl.className = 'status error';
+    return;
+  }}
+  const points = currentPoly.map(p => toReal(p.cx, p.cy));
+  zones.push({{ points }});
+  const n = points.length;
+  statusEl.textContent = `Polygone ajouté (${{n}} sommets)`;
+  statusEl.className = 'status';
+  currentPoly = [];
+  mousePos = null;
+  redraw();
+}}
+
+function cancelPoly() {{
+  currentPoly = [];
+  mousePos = null;
+  statusEl.textContent = 'Polygone en cours annulé';
+  statusEl.className = 'status';
+  redraw();
+}}
+
+canvas.addEventListener('click', (e) => {{
   const rect = canvas.getBoundingClientRect();
-  startX = e.clientX - rect.left;
-  startY = e.clientY - rect.top;
-  drawing = true;
+  const cx = e.clientX - rect.left;
+  const cy = e.clientY - rect.top;
+
+  // If close to first point and enough vertices → close
+  if (currentPoly.length >= 3) {{
+    const d = dist(cx, cy, currentPoly[0].cx, currentPoly[0].cy);
+    if (d < CLOSE_DIST) {{
+      closePoly();
+      return;
+    }}
+  }}
+
+  currentPoly.push({{ cx, cy }});
+  statusEl.textContent = `Sommet ${{currentPoly.length}} ajouté — ${{currentPoly.length < 3 ? 'ajoutez encore ' + (3 - currentPoly.length) + ' point(s) minimum' : 'double-clic ou clic sur le 1er point pour fermer'}}`;
+  statusEl.className = 'status';
+  redraw();
+}});
+
+canvas.addEventListener('dblclick', (e) => {{
+  e.preventDefault();
+  // Remove the last single-click point that was just added by the click event
+  if (currentPoly.length > 3) {{
+    currentPoly.pop();
+  }}
+  closePoly();
 }});
 
 canvas.addEventListener('mousemove', (e) => {{
-  if (!drawing) return;
+  if (currentPoly.length === 0) return;
   const rect = canvas.getBoundingClientRect();
-  curX = e.clientX - rect.left;
-  curY = e.clientY - rect.top;
+  mousePos = {{ cx: e.clientX - rect.left, cy: e.clientY - rect.top }};
   redraw();
 }});
 
-canvas.addEventListener('mouseup', (e) => {{
-  if (!drawing) return;
-  drawing = false;
-  const rect = canvas.getBoundingClientRect();
-  const endX = e.clientX - rect.left;
-  const endY = e.clientY - rect.top;
-
-  const [rx1, ry1] = toReal(Math.min(startX, endX), Math.min(startY, endY));
-  const [rx2, ry2] = toReal(Math.max(startX, endX), Math.max(startY, endY));
-
-  if (Math.abs(rx2 - rx1) > 5 && Math.abs(ry2 - ry1) > 5) {{
-    zones.push({{ x1: rx1, y1: ry1, x2: rx2, y2: ry2 }});
-    statusEl.textContent = `Zone ajoutée: (${{rx1}},${{ry1}}) → (${{rx2}},${{ry2}})`;
-    statusEl.className = 'status';
+document.addEventListener('keydown', (e) => {{
+  if (e.key === 'Escape') {{
+    cancelPoly();
   }}
-  redraw();
+  // Ctrl+Z to undo last vertex or last zone
+  if (e.key === 'z' && (e.ctrlKey || e.metaKey)) {{
+    e.preventDefault();
+    if (currentPoly.length > 0) {{
+      currentPoly.pop();
+      if (currentPoly.length === 0) mousePos = null;
+      statusEl.textContent = currentPoly.length > 0 ? `Sommet retiré (reste: ${{currentPoly.length}})` : 'Polygone en cours annulé';
+      statusEl.className = 'status';
+      redraw();
+    }} else {{
+      undoZone();
+    }}
+  }}
 }});
 
 function undoZone() {{
+  if (currentPoly.length > 0) {{
+    cancelPoly();
+    return;
+  }}
   if (zones.length > 0) {{
     zones.pop();
     statusEl.textContent = `Zone supprimée (reste: ${{zones.length}})`;
@@ -247,12 +382,19 @@ function undoZone() {{
 
 function resetZones() {{
   zones = [];
+  currentPoly = [];
+  mousePos = null;
   statusEl.textContent = 'Toutes les zones supprimées';
   statusEl.className = 'status';
   redraw();
 }}
 
 function saveZones() {{
+  if (currentPoly.length > 0) {{
+    statusEl.textContent = '⚠️ Fermez le polygone en cours avant de sauvegarder';
+    statusEl.className = 'status error';
+    return;
+  }}
   fetch('/save', {{
     method: 'POST',
     headers: {{ 'Content-Type': 'application/json' }},
