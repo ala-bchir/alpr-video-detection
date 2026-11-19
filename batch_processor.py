@@ -332,12 +332,31 @@ def start_glm_server():
     return True
 
 
-def wait_for_glm_server(timeout=360):
-    """Attend que le serveur GLM-OCR soit prêt."""
+def glm_api_ready():
+    """
+    True seulement si vLLM a fini de charger le modèle et répond à une vraie
+    requête (le container peut tourner bien avant que le modèle soit prêt).
+    """
+    try:
+        import requests
+        if requests.get(f"{VLLM_URL}/models", timeout=5).status_code != 200:
+            return False
+        r = requests.post(f"{VLLM_URL}/chat/completions", timeout=60, json={
+            "model": GLM_MODEL,
+            "messages": [{"role": "user", "content": "OK"}],
+            "max_tokens": 1,
+        })
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def wait_for_glm_server(timeout=600):
+    """Attend que le serveur GLM-OCR réponde réellement aux requêtes."""
     start_time = time.time()
     while time.time() - start_time < timeout:
-        if check_glm_server():
-            print("✅ Serveur GLM-OCR prêt!")
+        if glm_api_ready():
+            print(f"✅ Serveur GLM-OCR prêt! ({int(time.time() - start_time)}s)")
             return True
         print(f"⏳ Attente du chargement... ({int(time.time() - start_time)}s)")
         time.sleep(10)
@@ -877,6 +896,12 @@ def main():
         help="Affiche les postes et vidéos détectés sans traitement"
     )
     parser.add_argument(
+        "--ocr-only",
+        action="store_true",
+        help="Ne relance pas SAM3 : refait OCR + dédup + CSV à partir des crops "
+             "déjà extraits dans data/crops_per_video/{POSTE}/"
+    )
+    parser.add_argument(
         "--max-videos",
         type=int,
         default=0,
@@ -1000,7 +1025,7 @@ def main():
 
         # Préparer le dossier de crops par vidéo
         poste_crops_dir = os.path.join(CROPS_BASE_DIR, poste_name)
-        if os.path.exists(poste_crops_dir):
+        if os.path.exists(poste_crops_dir) and not args.ocr_only:
             shutil.rmtree(poste_crops_dir)
         os.makedirs(poste_crops_dir, exist_ok=True)
 
@@ -1012,7 +1037,7 @@ def main():
         log_progress(f"{'━' * 70}")
 
         # Arrêter GLM-OCR si actif (libérer la VRAM pour SAM3)
-        if check_glm_server():
+        if check_glm_server() and not args.ocr_only:
             stop_glm_server()
 
         videos_with_crops = []  # (video_path, crops_dir, video_name, fps, date_str, start_dt)
@@ -1024,6 +1049,29 @@ def main():
             video_start = time.time()
 
             date_str, start_dt = parse_video_name(video_name)
+
+            if args.ocr_only:
+                # Réutiliser les crops déjà extraits par SAM3 (aucun traitement GPU SAM3)
+                video_base = os.path.splitext(video_name)[0]
+                video_crop_dir = os.path.join(poste_crops_dir, video_base)
+                crop_files = [f for f in os.listdir(video_crop_dir)
+                              if f.lower().endswith(('.jpg', '.png', '.jpeg'))] \
+                    if os.path.isdir(video_crop_dir) else []
+                if crop_files:
+                    videos_with_crops.append({
+                        "video_path": video_path,
+                        "crops_dir": video_crop_dir,
+                        "frames_dir": os.path.join(poste_crops_dir, video_base + "_frames"),
+                        "video_name": video_name,
+                        "fps": get_video_fps(video_path),
+                        "date_str": date_str,
+                        "start_dt": start_dt,
+                        "crop_count": len(crop_files),
+                    })
+                    log_progress(f"📹 {video_name}: {len(crop_files)} crops existants (--ocr-only)")
+                else:
+                    log_progress(f"📹 {video_name}: aucun crop existant → ignorée (--ocr-only)")
+                continue
 
             # Conversion H.265 si nécessaire
             actual_video_path = video_path
@@ -1141,9 +1189,9 @@ def main():
             if not start_glm_server():
                 log_progress("   ❌ Impossible de démarrer GLM-OCR")
                 continue
-            if not wait_for_glm_server():
-                log_progress("   ❌ GLM-OCR timeout")
-                continue
+        if not wait_for_glm_server():
+            log_progress("   ❌ GLM-OCR timeout (API non prête) — poste ignoré")
+            continue
 
         phase2_start = time.time()
         poste_results = []
@@ -1158,30 +1206,39 @@ def main():
             files = sorted([f for f in os.listdir(vinfo["crops_dir"])
                            if f.lower().endswith(('.jpg', '.png', '.jpeg'))])
 
+            ocr_errors = []
+
             def _ocr_one(filename, crops_dir=vinfo["crops_dir"], client=ocr_client):
-                try:
-                    base64_image = encode_image(os.path.join(crops_dir, filename))
-                    response = client.chat.completions.create(
-                        model=GLM_MODEL,
-                        messages=[{
-                            "role": "user",
-                            "content": [
-                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
-                                {"type": "text", "text": OCR_PROMPT}
-                            ]
-                        }],
-                        max_tokens=50
-                    )
-                    raw_answer = response.choices[0].message.content.strip()
-                    plate_text = clean_plate_text(raw_answer)
-                    return {
-                        "filename": filename,
-                        "plate": plate_text,
-                        "frame": extract_frame_number(filename),
-                        "category": extract_vehicle_category(filename)
-                    }
-                except Exception:
-                    return None
+                for attempt in range(4):
+                    try:
+                        return _ocr_attempt(filename, crops_dir, client)
+                    except Exception as e:
+                        if attempt == 3:
+                            ocr_errors.append(f"{type(e).__name__}: {e}")
+                            return None
+                        time.sleep(2 ** attempt * 2)
+
+            def _ocr_attempt(filename, crops_dir, client):
+                base64_image = encode_image(os.path.join(crops_dir, filename))
+                response = client.chat.completions.create(
+                    model=GLM_MODEL,
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
+                            {"type": "text", "text": OCR_PROMPT}
+                        ]
+                    }],
+                    max_tokens=50
+                )
+                raw_answer = response.choices[0].message.content.strip()
+                plate_text = clean_plate_text(raw_answer)
+                return {
+                    "filename": filename,
+                    "plate": plate_text,
+                    "frame": extract_frame_number(filename),
+                    "category": extract_vehicle_category(filename)
+                }
 
             from concurrent.futures import ThreadPoolExecutor, as_completed
             ocr_results = []
@@ -1191,6 +1248,10 @@ def main():
                     result = future.result()
                     if result is not None:
                         ocr_results.append(result)
+
+            if ocr_errors:
+                log_progress(f"   ❌ {len(ocr_errors)}/{len(files)} crops en échec OCR après 4 essais "
+                             f"(ex: {ocr_errors[0][:150]})")
 
             if not ocr_results:
                 log_progress(f"   ⚠️  OCR sans résultat")
