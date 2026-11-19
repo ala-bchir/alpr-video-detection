@@ -170,6 +170,91 @@ def are_near_duplicates(plate1, plate2, very_close=False):
     return _confusable_match(p1, p2)
 
 
+_SIV_SHAPE_RE = re.compile(r'^([A-Z]{2})(\d{3})([A-Z]{2})$')
+
+
+def _siv_parts(plate):
+    """('AB', '123', 'CD') pour une lecture complète de forme SIV, sinon None."""
+    if "*" in plate:
+        return None
+    m = _SIV_SHAPE_RE.match(_normalize(plate))
+    return m.groups() if m else None
+
+
+def _same_vehicle_digits(plate1, plate2, max_letter_diff=1):
+    """
+    Même bloc de 3 chiffres ET au moins un groupe de lettres identique à
+    max_letter_diff lettre près : 'EG-301-HA' / 'SQ-301-HA', 'EQ-237-MA' / 'FQ-237-JV'.
+    """
+    a, b = _siv_parts(plate1), _siv_parts(plate2)
+    if not a or not b or a[1] != b[1]:
+        return False
+    return (_edit_distance(a[0], b[0]) <= max_letter_diff) or \
+           (_edit_distance(a[2], b[2]) <= max_letter_diff)
+
+
+def _partial_fuzzy_match(plate1, plate2):
+    """
+    Lecture partielle ('*', ≥ 5 caractères lus) qui correspond à une portion
+    contiguë d'une plaque complète avec au plus 1 caractère différent :
+    'OT373**' / 'DT-373-AD', '451VO**' / 'FR-451-VQ'.
+    """
+    if ("*" in plate1) == ("*" in plate2):
+        return False
+    partial, full = (plate1, plate2) if "*" in plate1 else (plate2, plate1)
+    p, f = _normalize(partial), _normalize(full)
+    if len(p) < 5 or len(p) >= len(f):
+        return False
+    for k in range(len(f) - len(p) + 1):
+        if sum(x != y for x, y in zip(p, f[k:k + len(p)])) <= 1:
+            return True
+    return False
+
+
+# Fenêtres (secondes) des règles de fusion d'un même passage
+CLOSE_WINDOW_S = 3      # ≤ 2 caractères quelconques d'écart
+PARTIAL_WINDOW_S = 5    # partielle ≈ portion d'une plaque complète (1 caractère d'écart)
+NEAR_WINDOW_S = 10      # are_near_duplicates
+DIGITS_WINDOW_S = 15    # mêmes chiffres + un groupe de lettres à 1 lettre près
+PARKED_WINDOW_S = 60    # mêmes chiffres + un groupe de lettres identique : chaîne sans
+                        # trou > 60 s (véhicule lent, arrêté ou garé relu pendant des minutes)
+
+
+def same_passage(plate1, plate2, dt):
+    """Deux lectures séparées de dt secondes appartiennent-elles au même passage ?"""
+    if dt <= NEAR_WINDOW_S and are_near_duplicates(plate1, plate2, very_close=dt <= CLOSE_WINDOW_S):
+        return True
+    if dt <= PARTIAL_WINDOW_S and _partial_fuzzy_match(plate1, plate2):
+        return True
+    if dt <= DIGITS_WINDOW_S and _same_vehicle_digits(plate1, plate2, max_letter_diff=1):
+        return True
+    return dt <= PARKED_WINDOW_S and _same_vehicle_digits(plate1, plate2, max_letter_diff=0)
+
+
+def _vote_plate(readings):
+    """
+    Vote caractère par caractère entre les lectures complètes de forme SIV d'un
+    groupe : chaque lecture se trompe à un endroit différent, la majorité par
+    position corrige ces erreurs isolées ('FF280LL', 'FF260AA', 'FF263AA',
+    'FE260AA' → 'FF-260-AA'). Égalité sur une position → caractère de la lecture
+    la plus cohérente avec l'ensemble du groupe. Retourne None si moins de
+    2 lectures SIV ou si le résultat n'est pas une SIV valide.
+    """
+    from collections import Counter
+    sivs = ["".join(p) for p in (_siv_parts(r) for r in readings) if p]
+    if len(sivs) < 2:
+        return None
+    pos_counts = [Counter(s[i] for s in sivs) for i in range(7)]
+    fb = max(sivs, key=lambda s: sum(pos_counts[i][c] for i, c in enumerate(s)))
+    voted = ""
+    for i in range(7):
+        counts = Counter(s[i] for s in sivs)
+        top = max(counts.values())
+        voted += fb[i] if counts.get(fb[i]) == top else counts.most_common(1)[0][0]
+    plate = f"{voted[:2]}-{voted[2:5]}-{voted[5:]}"
+    return plate if _SIV_RE.match(plate) else None
+
+
 def _plate_format(r):
     fmt = r.get("format")
     if fmt in ("SIV", "FNI"):
@@ -184,18 +269,35 @@ def _plate_format(r):
     return "UNKNOWN"
 
 
+_OVERLAY_RE = re.compile(r'[CG]V?A[MN][1I]|CAM|EURO|ZERO')
+
+
 def is_overlay_text(plate):
-    """Texte incrusté par la caméra (ex. 'CAM1', 'CAM107SZ', '300CAM1') — pas une plaque."""
-    p = _normalize(plate)
-    return p.startswith("CAM") or "CAM1" in p
-
-
-def _merge_near_passages(rows, time_window_s, close_window_s=3):
     """
-    Une passe : regroupe (union-find) les lectures distantes de ≤ time_window_s s
-    et similaires (are_near_duplicates, règle élargie à 2 éditions quelconques
-    si ≤ close_window_s s). Retourne une lecture par groupe, à l'heure
-    du premier passage. rows : liste de (datetime, dict) triée par temps.
+    Texte incrusté par la caméra ou parasite, pas une plaque :
+      'CAM1…' et ses lectures déformées ('GAM1000', 'CVAM1', 'CAN1', 'J00CAMI'),
+      'CAM1' tronqué en tête d'une lecture complète ('AM1562VV', 'M1E606ZN'),
+      'EURO00', 'ZERO00'.
+    Une lecture au format SIV ou FNI valide n'est jamais considérée comme une
+    incrustation (ex. 'AM-123-BC' est une vraie plaque).
+    """
+    raw = plate.upper().strip()
+    p = _normalize(plate)
+    if _SIV_RE.match(raw) or _SIV_RE.match(p) or _FNI_RE.match(raw):
+        return False
+    if _OVERLAY_RE.search(p):
+        return True
+    # 'CAM1' tronqué : seulement sur une lecture complète (une partielle 'AM166**'
+    # peut être le début d'une vraie plaque AM-166-…)
+    return "*" not in raw and len(p) >= 7 and (p.startswith("AM1") or p.startswith("M1"))
+
+
+def _merge_near_passages(rows):
+    """
+    Une passe : regroupe (union-find) les lectures d'un même passage
+    (same_passage) et retourne une lecture par groupe — plaque choisie par vote
+    caractère par caractère — à l'heure du premier passage.
+    rows : liste de (datetime, dict) triée par temps.
     """
     from collections import Counter
 
@@ -210,10 +312,9 @@ def _merge_near_passages(rows, time_window_s, close_window_s=3):
     for i in range(len(rows)):
         for j in range(i + 1, len(rows)):
             dt = (rows[j][0] - rows[i][0]).total_seconds()
-            if dt > time_window_s:
+            if dt > PARKED_WINDOW_S:
                 break
-            if are_near_duplicates(rows[i][1]["plate"], rows[j][1]["plate"],
-                                   very_close=dt <= close_window_s):
+            if same_passage(rows[i][1]["plate"], rows[j][1]["plate"], dt):
                 parent[find(j)] = find(i)
 
     groups = {}
@@ -232,6 +333,10 @@ def _merge_near_passages(rows, time_window_s, close_window_s=3):
         ))
         first_t, first = rows[idx[0]]  # idx est trié par temps
         best = dict(rows[best_k][1])
+        voted = _vote_plate([rows[k][1]["plate"] for k in idx])
+        if voted:
+            best["plate"] = voted
+            best["format"] = "SIV"
         best["date"] = first["date"]
         best["timestamp"] = first["timestamp"]
         if best.get("category", "INCONNU") == "INCONNU":
@@ -244,17 +349,21 @@ def _merge_near_passages(rows, time_window_s, close_window_s=3):
     return merged
 
 
-def deduplicate_poste(results, time_window_s=10, close_window_s=3):
+def deduplicate_poste(results):
     """
     Déduplication finale d'un poste, toutes vidéos et voies confondues.
 
-    0. Supprime le texte incrusté par la caméra ('CAM1…').
-    1. Fusionne les variantes OCR d'un même passage (≤ time_window_s s,
-       are_near_duplicates ; jusqu'à 2 caractères quelconques d'écart si
-       ≤ close_window_s s) — y compris le même véhicule filmé par les caméras
-       voie 1 et voie 2. Garde la meilleure lecture (SIV > FNI > autre, moins
-       de '*', plus fréquente) à l'heure du premier passage. Répété jusqu'à
-       stabilité (une fusion peut rapprocher deux groupes).
+    0. Supprime le texte incrusté par la caméra ('CAM1…', is_overlay_text).
+    1. Fusionne les lectures d'un même passage (same_passage) — y compris le
+       même véhicule filmé par les caméras voie 1 et voie 2 :
+         ≤ 3 s  : ≤ 2 caractères quelconques d'écart
+         ≤ 5 s  : partielle ≈ portion d'une plaque complète (1 caractère d'écart)
+         ≤ 10 s : 1 édition, partielle contenue, ≤ 2 substitutions confusables
+         ≤ 60 s entre deux lectures : mêmes 3 chiffres + un groupe de lettres
+                  à 1 lettre près (véhicule lent / arrêté / garé)
+       Plaque gardée : vote caractère par caractère entre les lectures SIV du
+       groupe (sinon SIV > FNI > autre, moins de '*', plus fréquente), à l'heure
+       du premier passage. Répété jusqu'à stabilité.
     2. Supprime les plaques strictement identiques sur tout le poste
        (une seule occurrence par plaque, la plus ancienne).
 
@@ -278,7 +387,7 @@ def deduplicate_poste(results, time_window_s=10, close_window_s=3):
     rows = sorted([(_ts(r), r) for r in results if _ts(r) is not None], key=lambda x: x[0])
 
     while True:
-        merged = _merge_near_passages(rows, time_window_s, close_window_s)
+        merged = _merge_near_passages(rows)
         if len(merged) == len(rows):
             break
         rows = merged

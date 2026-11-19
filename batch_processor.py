@@ -560,6 +560,19 @@ def run_homography():
     process_directory(CLEAN_DIR, CORRECTED_DIR)
 
 
+def is_unreadable_crop(path, max_brightness=45, max_contrast=9):
+    """
+    Crop noir et sans contraste (nuit, zone sombre) : l'OCR y invente une plaque.
+    Seuils mesurés sur ~290 000 crops : ne touche que ~0,2 % d'entre eux, tous
+    illisibles ; les plaques délavées mais lisibles ont un contraste ≥ 7-10 avec
+    une luminosité plus élevée.
+    """
+    img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        return False
+    return img.mean() < max_brightness and img.std() < max_contrast
+
+
 def encode_image(path):
     """Encode une image en base64."""
     with open(path, "rb") as f:
@@ -781,7 +794,7 @@ def remove_cross_video_duplicates(results, time_window_s=10):
     return unique
 
 
-def remove_poste_duplicates(results, time_window_s=10):
+def remove_poste_duplicates(results):
     """
     Dédup finale d'un poste (toutes vidéos et voies confondues) :
     variantes OCR d'un même passage (≤ time_window_s s, cf. dedup_plates.are_near_duplicates),
@@ -789,7 +802,7 @@ def remove_poste_duplicates(results, time_window_s=10):
     puis plaques identiques sur tout le poste.
     """
     from dedup_plates import deduplicate_poste
-    unique = deduplicate_poste(results, time_window_s=time_window_s)
+    unique = deduplicate_poste(results)
     if len(results) != len(unique):
         print(f"   🔁 Dédup poste: {len(results)} → {len(unique)}")
     return unique
@@ -1268,6 +1281,11 @@ def _main():
 
             files = sorted([f for f in os.listdir(vinfo["crops_dir"])
                            if f.lower().endswith(('.jpg', '.png', '.jpeg'))])
+            unreadable = [f for f in files
+                          if is_unreadable_crop(os.path.join(vinfo["crops_dir"], f))]
+            if unreadable:
+                files = [f for f in files if f not in set(unreadable)]
+                log_progress(f"   🌑 {len(unreadable)} crops sombres sans contraste ignorés (illisibles)")
 
             import threading
             ocr_errors = []
@@ -1310,7 +1328,11 @@ def _main():
                             {"type": "text", "text": OCR_PROMPT}
                         ]
                     }],
-                    max_tokens=50
+                    max_tokens=50,
+                    # Décodage glouton : sans ce paramètre vLLM échantillonne (temperature=1.0,
+                    # le generation_config de GLM-OCR ne fixe pas de température) → ~18 % de
+                    # lectures différentes d'un run à l'autre sur les mêmes crops.
+                    temperature=0
                 )
                 raw_answer = response.choices[0].message.content.strip()
                 plate_text = clean_plate_text(raw_answer)
