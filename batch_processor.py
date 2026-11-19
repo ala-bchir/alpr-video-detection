@@ -196,9 +196,9 @@ def discover_videos(poste_dir, poste_name=None):
     return sorted(videos)
 
 
-def get_video_direction(filename):
+def get_video_lane(filename):
     """
-    Retourne le sens ('1' ou '2') selon le préfixe du nom de fichier.
+    Retourne la voie ('1' ou '2') selon le préfixe du nom de fichier.
     Retourne None si le fichier ne commence pas par '1_' ou '2_'.
     """
     basename = os.path.basename(filename)
@@ -209,12 +209,12 @@ def get_video_direction(filename):
     return None
 
 
-def is_dual_direction(videos):
+def is_dual_lane(videos):
     """
-    Détecte si un poste est à double sens (contient des vidéos 1_ et 2_).
+    Détecte si un poste a deux voies (contient des vidéos 1_ et 2_).
     """
-    has_1 = any(get_video_direction(v) == "1" for v in videos)
-    has_2 = any(get_video_direction(v) == "2" for v in videos)
+    has_1 = any(get_video_lane(v) == "1" for v in videos)
+    has_2 = any(get_video_lane(v) == "2" for v in videos)
     return has_1 and has_2
 
 
@@ -467,7 +467,7 @@ def run_auto_sort():
     env["REJECTED_BASE_DIR"] = os.path.join(DATA_DIR, "rejected_plates")
 
     result = subprocess.run(
-        ["python3", "auto_sort_plates.py"],
+        [sys.executable, "auto_sort_plates.py"],
         env=env,
         cwd=BASE_DIR,
         capture_output=True, text=True
@@ -834,58 +834,6 @@ def export_poste_csv(poste_name, all_results):
     return output_file
 
 
-def export_poste_csv_dual(poste_name, all_results):
-    """
-    Exporte les résultats d'un poste double-sens dans deux CSV séparés.
-    Un fichier par sens : batch_{poste}_sens1_*.csv et batch_{poste}_sens2_*.csv
-    Colonnes: Poste, Date, Timestamp, Categorie, Plaque
-    """
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    # Séparer les résultats par direction
-    sens1 = [r for r in all_results if r.get("direction") == "1"]
-    sens2 = [r for r in all_results if r.get("direction") == "2"]
-
-    output_files = []
-
-    for sens_label, sens_results in [("sens1", sens1), ("sens2", sens2)]:
-        if not sens_results:
-            print(f"\n⚠️  {poste_name} {sens_label}: aucun résultat")
-            continue
-
-        sens_results.sort(key=lambda r: (r["date"], r["timestamp"]))
-        output_file = os.path.join(RESULTS_DIR, f"batch_{poste_name}_{sens_label}_{timestamp}.csv")
-
-        with open(output_file, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(["Poste", "Sens", "Date", "Timestamp", "Categorie", "Plaque"])
-
-            for r in sens_results:
-                writer.writerow([
-                    poste_name,
-                    r.get("direction", "?"),
-                    r["date"],
-                    r["timestamp"],
-                    r.get("category", "INCONNU"),
-                    r["plate"]
-                ])
-
-        output_files.append(output_file)
-        print(f"\n📄 CSV exporté ({sens_label}): {output_file}")
-        print(f"📊 {sens_label}: {len(sens_results)} plaques")
-
-        # Aperçu
-        print(f"\n📋 Aperçu {sens_label} (5 premières lignes):")
-        print("-" * 70)
-        for r in sens_results[:5]:
-            print(f"  {poste_name} | S{r.get('direction', '?')} | {r['date']} | {r['timestamp']} | {r.get('category', 'INCONNU')} | {r['plate']}")
-        if len(sens_results) > 5:
-            print(f"  ... et {len(sens_results) - 5} autres")
-
-    return output_files
-
-
 # ============== MAIN ==============
 
 def main():
@@ -940,7 +888,7 @@ def main():
 
     # Découvrir les vidéos par poste
     poste_videos = {}
-    poste_dual = {}  # True si le poste est à double sens
+    poste_dual = {}  # True si le poste a deux voies (vidéos 1_ et 2_)
     total_videos = 0
     for poste_name, poste_dir in postes:
         videos = discover_videos(poste_dir, poste_name)
@@ -951,10 +899,10 @@ def main():
             if date_str:
                 valid_videos.append(v)
         poste_videos[poste_name] = valid_videos
-        dual = is_dual_direction(valid_videos)
+        dual = is_dual_lane(valid_videos)
         poste_dual[poste_name] = dual
         total_videos += len(valid_videos)
-        dual_label = " ↔️ double-sens" if dual else ""
+        dual_label = " ↔️ 2 voies (CSV unique)" if dual else ""
         print(f"   📁 {poste_name}: {len(valid_videos)} vidéo(s){dual_label}")
 
     if total_videos == 0:
@@ -967,15 +915,15 @@ def main():
         print("🔍 MODE DRY-RUN — Liste des vidéos détectées")
         print("=" * 70)
         for poste_name, videos in poste_videos.items():
-            dual_label = " ↔️ double-sens" if poste_dual.get(poste_name) else ""
+            dual_label = " ↔️ 2 voies (CSV unique)" if poste_dual.get(poste_name) else ""
             print(f"\n📁 {poste_name} ({len(videos)} vidéos){dual_label}:")
             for v in videos:
                 vname = os.path.basename(v)
                 date_str, start_dt = parse_video_name(vname)
                 size_mb = os.path.getsize(v) / (1024 * 1024)
-                direction = get_video_direction(v)
-                dir_label = f" [Sens {direction}]" if direction else ""
-                print(f"   🎥 {vname}{dir_label} | {date_str} {start_dt.strftime('%H:%M:%S')} | {size_mb:.0f} MB")
+                lane = get_video_lane(v)
+                lane_label = f" [Voie {lane}]" if lane else ""
+                print(f"   🎥 {vname}{lane_label} | {date_str} {start_dt.strftime('%H:%M:%S')} | {size_mb:.0f} MB")
         print(f"\n📊 Total: {total_videos} vidéos dans {len(postes)} postes")
         print("✅ Dry-run terminé (aucun traitement effectué)")
         return
@@ -1300,10 +1248,10 @@ def main():
             if frames_copied > 0:
                 log_progress(f"   🖼️  {frames_copied} frames entières sauvées dans frames_per_poste/{poste_name}/")
 
-            # Ajouter la direction (sens) à chaque résultat
-            video_direction = get_video_direction(vinfo["video_name"])
+            # Ajouter la voie (préfixe 1_/2_) à chaque résultat (stats uniquement, pas dans le CSV)
+            video_lane = get_video_lane(vinfo["video_name"])
             for r in unique:
-                r["direction"] = video_direction
+                r["voie"] = video_lane
 
             poste_results.extend(unique)
             log_progress(f"   📊 {len(unique)} plaques uniques (total poste: {len(poste_results)})")
@@ -1320,16 +1268,14 @@ def main():
         # ── Export CSV pour ce poste ──
         poste_dur = time.time() - poste_start
         if poste_results:
+            # Un seul CSV par poste (les deux voies fusionnées, triées par Date puis Timestamp)
+            csv_path = export_poste_csv(poste_name, poste_results)
+            generated_csvs.append(csv_path)
             if poste_dual.get(poste_name):
-                # Export double-sens : deux CSV séparés
-                csv_paths = export_poste_csv_dual(poste_name, poste_results)
-                generated_csvs.extend(csv_paths)
-                sens1_count = sum(1 for r in poste_results if r.get("direction") == "1")
-                sens2_count = sum(1 for r in poste_results if r.get("direction") == "2")
-                log_progress(f"\n✅ Poste {poste_name} (double-sens): {len(poste_results)} plaques (S1:{sens1_count} S2:{sens2_count}) en {fmt_duration(poste_dur)}")
+                v1_count = sum(1 for r in poste_results if r.get("voie") == "1")
+                v2_count = sum(1 for r in poste_results if r.get("voie") == "2")
+                log_progress(f"\n✅ Poste {poste_name} (2 voies): {len(poste_results)} plaques (V1:{v1_count} V2:{v2_count}) en {fmt_duration(poste_dur)}")
             else:
-                csv_path = export_poste_csv(poste_name, poste_results)
-                generated_csvs.append(csv_path)
                 log_progress(f"\n✅ Poste {poste_name}: {len(poste_results)} plaques en {fmt_duration(poste_dur)}")
         else:
             log_progress(f"\n⚠️  Poste {poste_name}: aucun résultat ({fmt_duration(poste_dur)})")
