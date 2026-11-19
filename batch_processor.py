@@ -364,6 +364,58 @@ def wait_for_glm_server(timeout=600):
     return False
 
 
+def restart_glm_server():
+    """Redémarre complètement le container GLM-OCR et attend qu'il réponde."""
+    print("🔄 Redémarrage de GLM-OCR...")
+    stop_glm_server()
+    return start_glm_server() and wait_for_glm_server()
+
+
+def ensure_glm_ready():
+    """
+    Garantit un serveur GLM-OCR qui répond : le démarre s'il est absent,
+    attend s'il est en cours de chargement, le redémarre s'il est bloqué.
+    """
+    if glm_api_ready():
+        return True
+    if not check_glm_server():
+        print("🚀 Démarrage de GLM-OCR...")
+        if start_glm_server() and wait_for_glm_server():
+            return True
+    elif wait_for_glm_server(timeout=300):  # peut-être encore en chargement
+        return True
+    return restart_glm_server()
+
+
+# Échecs de traitement (vidéos/crops non traités) — récapitulés en fin de batch
+FAILURES = []
+
+
+def record_failure(poste, video, step, detail):
+    FAILURES.append({"poste": poste, "video": video, "step": step, "detail": detail})
+
+
+def release_gpu():
+    """Arrête tous les containers GPU du pipeline (GLM-OCR + SAM3) et libère la VRAM."""
+    print("\n🧹 Libération de la VRAM : arrêt des containers GLM-OCR et SAM3...")
+    subprocess.run(["docker", "stop", "qwen-labeler"], capture_output=True, text=True)
+    subprocess.run(["docker", "rm", "-f", "qwen-labeler"], capture_output=True, text=True)
+    ids = subprocess.run(
+        ["docker", "ps", "-q", "--filter", "ancestor=sam3-video-processor"],
+        capture_output=True, text=True
+    ).stdout.split()
+    if ids:
+        subprocess.run(["docker", "stop", *ids], capture_output=True, text=True)
+    try:
+        used = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=15
+        ).stdout.strip()
+        print(f"   ✅ Containers arrêtés — VRAM utilisée : {used}")
+    except Exception:
+        print("   ✅ Containers arrêtés")
+
+
 # ============== PIPELINE STEPS ==============
 
 def clean_work_directories():
@@ -470,7 +522,7 @@ def run_sam3_extraction(frame_skip=1, mask_zones=None):
 
     if process.returncode != 0:
         print(f"   ❌ SAM3 erreur (code {process.returncode})")
-        return False
+        return None  # erreur ≠ aucune plaque (False)
 
     crop_count = len([f for f in os.listdir(CROP_DIR)
                       if f.endswith(('.jpg', '.png', '.jpeg'))])
@@ -494,7 +546,7 @@ def run_auto_sort():
 
     if result.returncode != 0:
         print(f"   ❌ Erreur tri: {result.stderr[:300]}")
-        return False
+        return None  # erreur ≠ aucune plaque après tri (False)
 
     clean_count = len([f for f in os.listdir(CLEAN_DIR)
                        if f.endswith(('.jpg', '.png', '.jpeg'))])
@@ -868,7 +920,7 @@ def export_poste_csv(poste_name, all_results):
 
 # ============== MAIN ==============
 
-def main():
+def _main():
     parser = argparse.ArgumentParser(
         description="Batch Processor - Traitement multi-vidéos / multi-postes"
     )
@@ -1079,6 +1131,7 @@ def main():
                 converted = convert_h265_to_mp4(video_path)
                 if not converted:
                     log_progress(f"   ❌ Impossible de convertir {video_name}, ignoré")
+                    record_failure(poste_name, video_name, "conversion H.265", "ffmpeg a échoué")
                     video_times.append(time.time() - video_start)
                     continue
                 actual_video_path = converted
@@ -1112,6 +1165,11 @@ def main():
             sam3_dur = time.time() - step_start
             log_progress(f"   ⏱️  SAM3: {fmt_duration(sam3_dur)}")
 
+            if has_crops is None:
+                log_progress(f"   ❌ SAM3 en erreur → vidéo non traitée")
+                record_failure(poste_name, video_name, "SAM3", "container SAM3 en erreur")
+                video_times.append(time.time() - video_start)
+                continue
             if not has_crops:
                 log_progress(f"   ⏭️  Aucune plaque → vidéo suivante")
                 video_times.append(time.time() - video_start)
@@ -1119,7 +1177,13 @@ def main():
 
             # Auto-sort
             log_progress("   🗂️  Auto-sort...")
-            if not run_auto_sort():
+            sort_ok = run_auto_sort()
+            if sort_ok is None:
+                log_progress(f"   ❌ Tri en erreur → vidéo non traitée")
+                record_failure(poste_name, video_name, "tri", "auto_sort_plates.py en erreur")
+                video_times.append(time.time() - video_start)
+                continue
+            if not sort_ok:
                 log_progress(f"   ⏭️  Rien après tri → vidéo suivante")
                 video_times.append(time.time() - video_start)
                 continue
@@ -1183,14 +1247,13 @@ def main():
         log_progress(f"🤖 PHASE 2/{poste_name}: OCR + Filtres ({len(videos_with_crops)} vidéos, {total_crops} crops)")
         log_progress(f"{'━' * 70}")
 
-        # Démarrer GLM-OCR UNE SEULE FOIS pour tout le poste
-        if not check_glm_server():
-            log_progress("   🚀 Démarrage GLM-OCR (une seule fois pour tout le poste)...")
-            if not start_glm_server():
-                log_progress("   ❌ Impossible de démarrer GLM-OCR")
-                continue
-        if not wait_for_glm_server():
-            log_progress("   ❌ GLM-OCR timeout (API non prête) — poste ignoré")
+        # GLM-OCR prêt (démarré une seule fois pour tout le poste, redémarré si bloqué)
+        log_progress("   🚀 Vérification / démarrage GLM-OCR...")
+        if not ensure_glm_ready():
+            log_progress("   ❌ GLM-OCR indisponible même après redémarrage — OCR du poste non fait")
+            for vinfo in videos_with_crops:
+                record_failure(poste_name, vinfo["video_name"], "OCR",
+                               f"GLM-OCR indisponible ({vinfo['crop_count']} crops non lus)")
             continue
 
         phase2_start = time.time()
@@ -1206,15 +1269,33 @@ def main():
             files = sorted([f for f in os.listdir(vinfo["crops_dir"])
                            if f.lower().endswith(('.jpg', '.png', '.jpeg'))])
 
+            import threading
             ocr_errors = []
+            # Coupe-circuit : après N échecs consécutifs, le serveur est considéré hors
+            # service → les crops restants sont mis de côté immédiatement (sans attendre
+            # leurs essais), puis GLM-OCR est redémarré et ces crops relancés.
+            server_down = threading.Event()
+            fail_streak = [0]
+            streak_lock = threading.Lock()
+            MAX_FAIL_STREAK = 16
 
             def _ocr_one(filename, crops_dir=vinfo["crops_dir"], client=ocr_client):
+                if server_down.is_set():
+                    ocr_errors.append((filename, "serveur GLM-OCR hors service"))
+                    return None
                 for attempt in range(4):
                     try:
-                        return _ocr_attempt(filename, crops_dir, client)
+                        result = _ocr_attempt(filename, crops_dir, client)
+                        with streak_lock:
+                            fail_streak[0] = 0
+                        return result
                     except Exception as e:
-                        if attempt == 3:
-                            ocr_errors.append(f"{type(e).__name__}: {e}")
+                        if attempt == 3 or server_down.is_set():
+                            with streak_lock:
+                                fail_streak[0] += 1
+                                if fail_streak[0] >= MAX_FAIL_STREAK:
+                                    server_down.set()
+                            ocr_errors.append((filename, f"{type(e).__name__}: {e}"))
                             return None
                         time.sleep(2 ** attempt * 2)
 
@@ -1241,17 +1322,40 @@ def main():
                 }
 
             from concurrent.futures import ThreadPoolExecutor, as_completed
-            ocr_results = []
-            with ThreadPoolExecutor(max_workers=8) as executor:
-                futures = {executor.submit(_ocr_one, f): f for f in files}
-                for future in as_completed(futures):
-                    result = future.result()
-                    if result is not None:
-                        ocr_results.append(result)
 
-            if ocr_errors:
-                log_progress(f"   ❌ {len(ocr_errors)}/{len(files)} crops en échec OCR après 4 essais "
-                             f"(ex: {ocr_errors[0][:150]})")
+            def _run_ocr(file_list):
+                out = []
+                with ThreadPoolExecutor(max_workers=8) as executor:
+                    futures = {executor.submit(_ocr_one, f): f for f in file_list}
+                    for future in as_completed(futures):
+                        result = future.result()
+                        if result is not None:
+                            out.append(result)
+                return out
+
+            ocr_results = _run_ocr(files)
+
+            restarts = 0
+            had_errors = bool(ocr_errors)
+            while ocr_errors and restarts < 2:
+                failed_files = [f for f, _ in ocr_errors]
+                log_progress(f"   ❌ {len(failed_files)}/{len(files)} crops en échec OCR "
+                             f"(ex: {ocr_errors[0][1][:150]}) → redémarrage GLM-OCR et nouvel essai")
+                ocr_errors.clear()
+                server_down.clear()
+                fail_streak[0] = 0
+                restarts += 1
+                if not restart_glm_server():
+                    ocr_errors.extend((f, "GLM-OCR indisponible après redémarrage") for f in failed_files)
+                    break
+                ocr_results += _run_ocr(failed_files)
+            if had_errors:
+                if ocr_errors:
+                    log_progress(f"   ❌ {len(ocr_errors)} crops toujours non lus (ex: {ocr_errors[0][1][:150]})")
+                    record_failure(poste_name, vinfo["video_name"], "OCR",
+                                   f"{len(ocr_errors)}/{len(files)} crops non lus ({ocr_errors[0][1][:100]})")
+                else:
+                    log_progress(f"   ✅ Tous les crops en échec ont été rattrapés après redémarrage")
 
             if not ocr_results:
                 log_progress(f"   ⚠️  OCR sans résultat")
@@ -1355,7 +1459,7 @@ def main():
             log_progress(f"\n⚠️  Poste {poste_name}: aucun résultat ({fmt_duration(poste_dur)})")
 
         # Arrêter GLM-OCR pour le prochain poste (SAM3 a besoin de VRAM)
-        if check_glm_server():
+        if check_glm_server() and not args.ocr_only:
             stop_glm_server()
 
     # ============ RÉSUMÉ FINAL ============
@@ -1376,10 +1480,41 @@ def main():
     if not generated_csvs:
         summary.append("   ⚠️  Aucun CSV généré")
 
+    if FAILURES:
+        summary.append(f"\n❌ {len(FAILURES)} ÉCHEC(S) — vidéos/crops NON traités :")
+        for f in FAILURES:
+            summary.append(f"   → {f['poste']} | {f['video']} | {f['step']} | {f['detail']}")
+        ocr_postes = sorted({f['poste'] for f in FAILURES if f['step'] == 'OCR'})
+        if ocr_postes:
+            summary.append("   ↪ Rattrapage OCR sans refaire SAM3 : "
+                           "python3 batch_processor.py --ocr-only --postes " + " ".join(ocr_postes))
+    else:
+        summary.append("\n✅ Aucun échec : toutes les vidéos ont été traitées")
+
     summary.append(f"\n📝 Log complet: {progress_log}")
 
     for line in summary:
         log_progress(line)
+
+
+def main():
+    """Lance le batch puis libère toujours la VRAM (fin normale, erreur ou Ctrl+C)."""
+    exit_code = 0
+    try:
+        _main()
+    except KeyboardInterrupt:
+        print("\n⛔ Interrompu par l'utilisateur")
+        exit_code = 130
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        exit_code = 2
+    finally:
+        if not {"--dry-run", "-h", "--help"} & set(sys.argv):
+            release_gpu()
+    if FAILURES and exit_code == 0:
+        exit_code = 1
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
