@@ -724,7 +724,8 @@ def calculate_timestamps(results, start_datetime, fps):
             "format": r.get("format", "UNKNOWN"),
             "frame": r["frame"],
             "category": r.get("category", "INCONNU"),
-            "filename": r.get("filename", "")
+            "filename": r.get("filename", ""),
+            "readings": r.get("readings", [r["plate"]]),
         })
     return final
 

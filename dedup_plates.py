@@ -119,6 +119,9 @@ def deduplicate(results, fps, time_window=3):
                 if candidate is not best:
                     best = candidate
 
+        best = dict(best)
+        # Toutes les lectures OCR du groupe, pour le vote final au niveau du poste
+        best["readings"] = [r for g in group for r in g.get("readings", [g["plate"]])]
         deduplicated.append(best)
 
     return deduplicated
@@ -181,7 +184,7 @@ def _siv_parts(plate):
     return m.groups() if m else None
 
 
-def _same_vehicle_digits(plate1, plate2, max_letter_diff=1):
+def _same_vehicle_digits(plate1, plate2, max_letter_diff=0):
     """
     Même bloc de 3 chiffres ET au moins un groupe de lettres identique à
     max_letter_diff lettre près : 'EG-301-HA' / 'SQ-301-HA', 'EQ-237-MA' / 'FQ-237-JV'.
@@ -211,13 +214,43 @@ def _partial_fuzzy_match(plate1, plate2):
     return False
 
 
+def _longest_common_run(a, b):
+    best = 0
+    for i in range(len(a)):
+        for j in range(len(b)):
+            k = 0
+            while i + k < len(a) and j + k < len(b) and a[i + k] == b[j + k]:
+                k += 1
+            best = max(best, k)
+    return best
+
+
+def _weak_reading_overlap(plate1, plate2, min_run=3):
+    """
+    Une lecture « faible » (partielle '*' ou hors format SIV/FNI) et une SIV
+    complète partageant ≥ min_run caractères consécutifs : 'EY2005*' / 'EY-200-SK',
+    '361XJH*' / 'DT-361-XJ', 'BU241Y*' / 'BJ-234-TY' (non : 2 seulement).
+    """
+    def weak(p):
+        return "*" in p or not (_SIV_RE.match(p.upper()) or _FNI_RE.match(p.upper()))
+    if weak(plate1) == weak(plate2):
+        return False
+    strong = plate2 if weak(plate1) else plate1
+    if not _SIV_RE.match(strong.upper()):
+        return False
+    return _longest_common_run(_normalize(plate1), _normalize(plate2)) >= min_run
+
+
 # Fenêtres (secondes) des règles de fusion d'un même passage
 CLOSE_WINDOW_S = 3      # ≤ 2 caractères quelconques d'écart
 PARTIAL_WINDOW_S = 5    # partielle ≈ portion d'une plaque complète (1 caractère d'écart)
 NEAR_WINDOW_S = 10      # are_near_duplicates
-DIGITS_WINDOW_S = 15    # mêmes chiffres + un groupe de lettres à 1 lettre près
-PARKED_WINDOW_S = 60    # mêmes chiffres + un groupe de lettres identique : chaîne sans
-                        # trou > 60 s (véhicule lent, arrêté ou garé relu pendant des minutes)
+PARTIAL_RUN_WINDOW_S = 2   # lecture faible (partielle / hors format) ≥ 3 car. consécutifs
+                            # communs avec une SIV complète
+PARKED_WINDOW_S = 60    # mêmes chiffres + un groupe de lettres IDENTIQUE : chaîne sans
+                        # trou > 60 s (véhicule lent, arrêté ou garé relu pendant des minutes).
+                        # NB : « à 1 lettre près » fusionnait des véhicules différents en
+                        # trafic dense (EP-700-AA / EV-700-ZZ sur E5) → abandonné.
 
 
 def same_passage(plate1, plate2, dt):
@@ -226,7 +259,7 @@ def same_passage(plate1, plate2, dt):
         return True
     if dt <= PARTIAL_WINDOW_S and _partial_fuzzy_match(plate1, plate2):
         return True
-    if dt <= DIGITS_WINDOW_S and _same_vehicle_digits(plate1, plate2, max_letter_diff=1):
+    if dt <= PARTIAL_RUN_WINDOW_S and _weak_reading_overlap(plate1, plate2):
         return True
     return dt <= PARKED_WINDOW_S and _same_vehicle_digits(plate1, plate2, max_letter_diff=0)
 
@@ -333,10 +366,12 @@ def _merge_near_passages(rows):
         ))
         first_t, first = rows[idx[0]]  # idx est trié par temps
         best = dict(rows[best_k][1])
-        voted = _vote_plate([rows[k][1]["plate"] for k in idx])
+        all_readings = [x for k in idx for x in rows[k][1].get("readings", [rows[k][1]["plate"]])]
+        voted = _vote_plate(all_readings)
         if voted:
             best["plate"] = voted
             best["format"] = "SIV"
+        best["readings"] = all_readings
         best["date"] = first["date"]
         best["timestamp"] = first["timestamp"]
         if best.get("category", "INCONNU") == "INCONNU":
