@@ -710,6 +710,19 @@ def remove_cross_video_duplicates(results, time_window_s=10):
     return unique
 
 
+def remove_poste_duplicates(results, time_window_s=10):
+    """
+    Dédup finale d'un poste (toutes vidéos et voies confondues) :
+    variantes OCR d'un même passage (≤ time_window_s s, cf. dedup_plates.are_near_duplicates),
+    y compris le même véhicule vu par les caméras voie 1 et voie 2,
+    puis plaques identiques sur tout le poste.
+    """
+    from dedup_plates import deduplicate_poste
+    unique = deduplicate_poste(results, time_window_s=time_window_s)
+    if len(results) != len(unique):
+        print(f"   🔁 Dédup poste: {len(results)} → {len(unique)}")
+    return unique
+
 # ============== TRAITEMENT D'UNE VIDÉO ==============
 
 def process_single_video(video_path, frame_skip=1, time_window=3, glm_ready=False):
@@ -1261,7 +1274,7 @@ def main():
 
         # ── Déduplication globale du poste (toutes vidéos confondues) ──
         before_global = len(poste_results)
-        poste_results = remove_cross_video_duplicates(poste_results, time_window_s=None)
+        poste_results = remove_poste_duplicates(poste_results)
         if len(poste_results) != before_global:
             log_progress(f"   🔁 Dédup globale: {before_global} → {len(poste_results)} plaques uniques")
 
